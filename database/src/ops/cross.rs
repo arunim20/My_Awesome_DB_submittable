@@ -91,7 +91,7 @@ where
     R: Read + BufRead,
 {
     let mut block_idx = 0usize;
-    let right_buffer_blocks = std::cmp::max(1, (memory_limit_mb as usize * 1024 * 1024 * 40 / 100) / block_size);
+    let right_buffer_blocks = std::cmp::min(256, std::cmp::max(1, (memory_limit_mb as usize * 1024 * 1024 * 10 / 100) / block_size));
 
     while block_idx < total_right_blocks {
         let fetch = std::cmp::min(right_buffer_blocks, total_right_blocks - block_idx);
@@ -170,7 +170,7 @@ where
     let mut right_start_block = 0;
     let mut total_right_blocks = 0;
     let mut right_row_buf: Vec<Vec<Data>> = Vec::new();
-    let right_chunk_bytes_limit = (memory_limit_mb as usize * 1024 * 1024 * 40) / 100;
+    let right_chunk_bytes_limit = (memory_limit_mb as usize * 1024 * 1024 * 12) / 100;
     let mut current_right_bytes = 0;
 
     // Bootstrap allocator safely avoiding borrow interference
@@ -239,7 +239,7 @@ where
     let (inner_in_raw, mut inner_out2) = setup_disk_io();
     let mut inner_buf = BufReader::new(inner_in_raw);
     let mut left_chunk: Vec<Vec<Data>> = Vec::new();
-    let left_chunk_bytes_limit = (memory_limit_mb as usize * 1024 * 1024 * 40) / 100;
+    let left_chunk_bytes_limit = (memory_limit_mb as usize * 1024 * 1024 * 12) / 100;
     let mut current_left_bytes = 0;
 
     execute_op(

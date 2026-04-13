@@ -49,8 +49,8 @@ impl RunStreamer {
             return Ok(None);
         }
 
-        // Read up to 16 blocks at once to reduce simulated seek penalties
-        let fetch = std::cmp::min(16, self.run.num_blocks - self.current_block_idx);
+        // Read up to 8 blocks at once — balances seek penalty vs memory per streamer
+        let fetch = std::cmp::min(8, self.run.num_blocks - self.current_block_idx);
         let block_data = read_blocks(
             disk_out,
             disk_raw,
@@ -160,6 +160,101 @@ fn unpack_block(
     Ok(rows)
 }
 
+/// Merge a group of sorted runs into a single new run written to anonymous disk.
+/// Used by cascading merge to keep the number of concurrent streamers bounded.
+fn merge_runs_to_disk<W: Write, R: Read + BufRead>(
+    group: &[Run],
+    schema: &[ColumnInfo],
+    sort_keys: &[(usize, bool)],
+    block_size: usize,
+    disk_out: &mut W,
+    disk_buf: &mut R,
+) -> Result<Run> {
+    let mut heap = BinaryHeap::new();
+    let mut streamers: Vec<RunStreamer> = group
+        .iter()
+        .map(|run| RunStreamer::new(run.clone(), schema.to_vec()))
+        .collect();
+
+    for (i, streamer) in streamers.iter_mut().enumerate() {
+        if let Some(row) = streamer.next(disk_out, disk_buf, block_size)? {
+            heap.push(HeapItem {
+                row,
+                run_idx: i,
+                sort_keys: sort_keys.to_vec(),
+            });
+        }
+    }
+
+    let mut current_block = Vec::with_capacity(block_size);
+    let mut row_count = 0u16;
+    let mut row_buf = Vec::new();
+    let mut pending_bytes: Vec<u8> = Vec::new();
+    let mut first_block_id: Option<u64> = None;
+    let mut total_blocks = 0usize;
+    let flush_threshold = 256; // write 256 blocks (~1MB) at a time
+
+    while let Some(min_item) = heap.pop() {
+        row_buf.clear();
+        encode_row(&min_item.row, &mut row_buf);
+
+        if current_block.len() + row_buf.len() > block_size - 2 {
+            current_block.resize(block_size - 2, 0);
+            current_block.extend_from_slice(&row_count.to_le_bytes());
+            pending_bytes.extend_from_slice(&current_block);
+            total_blocks += 1;
+            current_block.clear();
+            row_count = 0;
+
+            if pending_bytes.len() >= flush_threshold * block_size {
+                let num = pending_bytes.len() / block_size;
+                let start = crate::disk::allocate_anon_block_chunk(num as u64);
+                if first_block_id.is_none() {
+                    first_block_id = Some(start);
+                }
+                write_blocks(disk_out, start, num, &pending_bytes)?;
+                pending_bytes.clear();
+            }
+        }
+
+        current_block.extend_from_slice(&row_buf);
+        row_count += 1;
+
+        if let Some(next_row) =
+            streamers[min_item.run_idx].next(disk_out, disk_buf, block_size)?
+        {
+            heap.push(HeapItem {
+                row: next_row,
+                run_idx: min_item.run_idx,
+                sort_keys: sort_keys.to_vec(),
+            });
+        }
+    }
+
+    // Finalize last partial block
+    if row_count > 0 {
+        current_block.resize(block_size - 2, 0);
+        current_block.extend_from_slice(&row_count.to_le_bytes());
+        pending_bytes.extend_from_slice(&current_block);
+        total_blocks += 1;
+    }
+
+    // Flush remaining
+    if !pending_bytes.is_empty() {
+        let num = pending_bytes.len() / block_size;
+        let start = crate::disk::allocate_anon_block_chunk(num as u64);
+        if first_block_id.is_none() {
+            first_block_id = Some(start);
+        }
+        write_blocks(disk_out, start, num, &pending_bytes)?;
+    }
+
+    Ok(Run {
+        start_block: first_block_id.unwrap_or(0),
+        num_blocks: total_blocks,
+    })
+}
+
 pub fn execute_sort<W, R>(
     sort: &SortData,
     ctx: &DbContext,
@@ -193,7 +288,7 @@ where
     // Stream the data
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
-    let chunk_limit_bytes = (memory_limit_mb as usize * 1024 * 1024 * 40) / 100;
+    let chunk_limit_bytes = (memory_limit_mb as usize * 1024 * 1024 * 20) / 100;
     let mut current_chunk_bytes = 0;
 
     execute_op(
@@ -298,8 +393,41 @@ where
 
     eprintln!("[sort] merging {} spilled runs", runs.len());
 
+    const MAX_MERGE_WIDTH: usize = 64;
+
+    // Cascading merge: if too many runs for a single merge pass, merge in
+    // groups of MAX_MERGE_WIDTH, producing fewer intermediate runs, and repeat
+    // until the total count is small enough for a direct final merge.
+    while runs.len() > MAX_MERGE_WIDTH {
+        eprintln!(
+            "[sort] cascading merge: {} runs → groups of {}",
+            runs.len(),
+            MAX_MERGE_WIDTH
+        );
+        let mut new_runs = Vec::new();
+
+        for group_start in (0..runs.len()).step_by(MAX_MERGE_WIDTH) {
+            let group_end = std::cmp::min(group_start + MAX_MERGE_WIDTH, runs.len());
+            let group: Vec<Run> = runs[group_start..group_end].to_vec();
+
+            let merged = merge_runs_to_disk(
+                &group, &schema, &sort_keys, block_size, disk_out, disk_buf,
+            )?;
+            if merged.num_blocks > 0 {
+                new_runs.push(merged);
+            }
+        }
+
+        runs = new_runs;
+    }
+
+    eprintln!("[sort] final merge: {} runs", runs.len());
+
     let mut heap = BinaryHeap::new();
-    let mut streamers: Vec<RunStreamer> = runs.into_iter().map(|run| RunStreamer::new(run, schema.clone())).collect();
+    let mut streamers: Vec<RunStreamer> = runs
+        .into_iter()
+        .map(|run| RunStreamer::new(run, schema.clone()))
+        .collect();
 
     // Populate Heap with root headers
     for (i, streamer) in streamers.iter_mut().enumerate() {

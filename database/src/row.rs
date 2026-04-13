@@ -65,9 +65,9 @@ pub fn encode_row_len(row: &[Data]) -> usize {
             Data::Int64(_) | Data::Float64(_) => len += 8,
             Data::String(v) => len += v.len() + 1,
         }
-        len += 64; // Aggressive multiplier per tag for alignment/fragmentation OS overhead
+        len += 40; // Data enum (32 bytes) + per-element overhead
     }
-    len += 256; // High base vector penalty
+    len += 64; // Vec<Data> header + allocator overhead
     len
 }
 

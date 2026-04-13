@@ -169,7 +169,7 @@ where
     // ── Initialize allocator (idempotent, needed if Grace fallback triggers) ─
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
-    let mem_budget = (memory_limit_mb as usize * 1024 * 1024 * 40) / 100;
+    let mem_budget = (memory_limit_mb as usize * 1024 * 1024 * 15) / 100;
     let bucket_byte_limit = std::cmp::max(1, mem_budget / NUM_BUCKETS);
 
     // State for adaptive collection

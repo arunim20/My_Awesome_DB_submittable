@@ -32,7 +32,7 @@ struct CacheEntry {
 
 static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
 static CACHE_SIZE_BYTES: Mutex<usize> = Mutex::new(0);
-const CACHE_LIMIT_BYTES: usize = 30 * 1024 * 1024; // 30MB
+const CACHE_LIMIT_BYTES: usize = 4 * 1024 * 1024; // 4MB — must stay low to fit in 64MB RLIMIT_AS
 
 pub fn read_blocks<R: Read>(
     disk_out: &mut impl Write,
