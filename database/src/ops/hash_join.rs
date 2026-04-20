@@ -14,25 +14,29 @@ const NUM_BUCKETS: usize = 64;
 
 // ── Bloom Filter ──────────────────────────────────────────────────────────────
 
-/// A lightweight Bloom Filter backed by a 4096-bit (512-byte) bitset.
+/// Bloom filter size: 1 MB = 8 388 608 bits (131 072 × u64).
 ///
 /// Used to pre-filter the left (probe) side of a Grace Hash Join: any left row
 /// whose join key provably does not exist on the right side is discarded
 /// immediately, without being written to a grace bucket on disk.
 ///
 /// Uses 3 independent hash probes derived from a single `DefaultHasher` call.
-/// False-positive rate for a 4096-bit filter with 3 probes:
-///   - At  10 000 right rows: ~4%
-///   - At  50 000 right rows: ~50%   (effectiveness decreases; grace is used anyway)
+/// False-positive rate for an 8M-bit filter with 3 probes:
+///   - At  50 000 right rows: ≈0.004%  (virtually zero false positives)
+///   - At 500 000 right rows: ≈0.4%    (still excellent)
 ///
-/// Memory cost: 64 × u64 = 512 bytes — negligible compared to the 64 MB limit.
+/// Memory cost: 1 MB — fits comfortably in the 64 MB budget and prevents
+/// millions of unnecessary grace partition disk writes/reads.
+const BLOOM_BITS: usize = 8_388_608;
+const BLOOM_WORDS: usize = BLOOM_BITS / 64; // 131 072 u64s = 1 MB
+
 struct BloomFilter {
-    bits: [u64; 64], // 64 × 64-bit words = 4096 bits
+    bits: Vec<u64>,
 }
 
 impl BloomFilter {
     fn new() -> Self {
-        BloomFilter { bits: [0u64; 64] }
+        BloomFilter { bits: vec![0u64; BLOOM_WORDS] }
     }
 
     /// Derive 3 independent bit positions from a join key via bit-mixing.
@@ -50,9 +54,9 @@ impl BloomFilter {
             .wrapping_add(0xd2a98b26625eee7b);
 
         [
-            (h1 % 4096) as usize,
-            (h2 % 4096) as usize,
-            (h3 % 4096) as usize,
+            (h1 % BLOOM_BITS as u64) as usize,
+            (h2 % BLOOM_BITS as u64) as usize,
+            (h3 % BLOOM_BITS as u64) as usize,
         ]
     }
 
@@ -240,6 +244,8 @@ where
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
     // 15% of memory limit for the right-side collection budget.
+    // 10% of memory limit — reduced from 15% to allow 4+ nested hash joins
+    // within the 64 MB budget without OOM.
     let mem_budget       = (memory_limit_mb as usize * 1024 * 1024 * 10) / 100;
     let bucket_byte_limit = std::cmp::max(1, mem_budget / NUM_BUCKETS);
 
@@ -322,6 +328,11 @@ where
         }
     }
 
+    // Free grace-mode buffers immediately — they are fully flushed and no
+    // longer referenced.  Reclaims capacity overhead (~few KB) early.
+    drop(grace_buffers);
+    drop(grace_bucket_bytes);
+
     // ── FAST PATH: entire right side fits in memory ───────────────────────────
     if !budget_exceeded {
         eprintln!(
@@ -401,6 +412,9 @@ where
             flush_bucket(&mut left_buffers[b], &mut left_runs[b], &mut chunk_out, block_size)?;
         }
     }
+
+    // Free the 1 MB bloom filter — no longer needed after left-side partitioning.
+    drop(bloom);
 
     // ── Phase 3: probe bucket by bucket ──────────────────────────────────────
     eprintln!("[hash_join] Phase 3: probing buckets via in-memory hashing");

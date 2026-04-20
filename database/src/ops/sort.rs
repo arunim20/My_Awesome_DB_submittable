@@ -78,8 +78,9 @@ impl RunStreamer {
             return Ok(None); // End of run
         }
 
-        // Read up to 8 blocks at once — balances seek penalty vs. memory per streamer
-        let fetch = std::cmp::min(8, self.run.num_blocks - self.current_block_idx);
+        // Read up to 32 blocks at once — aligns with 256-block write chunks and
+        // amortises seek overhead much better than the previous 8-block default.
+        let fetch = std::cmp::min(32, self.run.num_blocks - self.current_block_idx);
         let block_data = read_blocks(
             disk_out,
             disk_raw,
@@ -407,11 +408,12 @@ where
     let mut chunk_bytes: Vec<u8> = Vec::new();
     let mut chunk_index: Vec<ChunkEntry> = Vec::new();
 
-    // 12% of memory_limit — balanced to allow 4+ nested operators in ~41 MB heap.
+    // 8% of memory_limit — reduced from 12% to allow 4+ nested operators
+    // (e.g. Sort over 3× HashJoin) within the 64 MB budget.
     // NOTE: main.rs already called set_anon_block_base() before execute_op runs.
     //       Do NOT call get_anon_start_block() or init_anon_block_allocator() here —
     //       that would inject extra IPC commands on the disk pipe mid-execution.
-    let chunk_limit_bytes = (memory_limit_mb as usize * 1024 * 1024 * 12) / 100;
+    let chunk_limit_bytes = (memory_limit_mb as usize * 1024 * 1024 * 8) / 100;
 
     // Reusable encode buffer to avoid per-row allocations.
     let mut row_encode_buf: Vec<u8> = Vec::new();
