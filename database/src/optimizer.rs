@@ -622,3 +622,32 @@ pub fn estimate_cardinality(op: &QueryOp, ctx: &DbContext) -> usize {
         }
     }
 }
+
+/// Compute the maximum number of memory-heavy operators (HashJoin, Sort, Cross)
+/// that can be alive simultaneously on the Rust call stack during execution.
+///
+/// For binary operators (HashJoin, Cross), the right child is fully executed
+/// first, then the left child is streamed.  At any moment only ONE child is
+/// active alongside the parent, so we take `max(left_depth, right_depth)`.
+///
+/// This drives the dynamic per-operator memory budget in `ops::mod.rs`.
+pub fn max_concurrent_heavy_ops(op: &QueryOp) -> usize {
+    match op {
+        QueryOp::HashJoin(h) => {
+            let l = max_concurrent_heavy_ops(&h.left);
+            let r = max_concurrent_heavy_ops(&h.right);
+            1 + std::cmp::max(l, r)
+        }
+        QueryOp::Sort(s) => {
+            1 + max_concurrent_heavy_ops(&s.underlying)
+        }
+        QueryOp::Cross(c) => {
+            let l = max_concurrent_heavy_ops(&c.left);
+            let r = max_concurrent_heavy_ops(&c.right);
+            1 + std::cmp::max(l, r)
+        }
+        QueryOp::Filter(f) => max_concurrent_heavy_ops(&f.underlying),
+        QueryOp::Project(p) => max_concurrent_heavy_ops(&p.underlying),
+        QueryOp::Scan(_) => 0,
+    }
+}

@@ -37,6 +37,11 @@ fn db_main() -> Result<()> {
     query.root = crate::optimizer::optimize(query.root, &ctx)?;
     // eprintln!("Optimized Query: {:#?}", query);
 
+    // Compute max concurrent heavy operators and set the dynamic budget.
+    let heavy_ops = crate::optimizer::max_concurrent_heavy_ops(&query.root);
+    crate::ops::set_heavy_op_count(heavy_ops);
+    eprintln!("Max concurrent heavy ops: {} → per-op budget = 50%/{} of limit", heavy_ops, heavy_ops);
+
     // Block size from disk
     disk_out.write_all(b"get block-size\n")?;
     disk_out.flush()?;

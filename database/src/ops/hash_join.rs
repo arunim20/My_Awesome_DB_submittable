@@ -14,21 +14,22 @@ const NUM_BUCKETS: usize = 64;
 
 // ── Bloom Filter ──────────────────────────────────────────────────────────────
 
-/// Bloom filter size: 1 MB = 8 388 608 bits (131 072 × u64).
+/// Bloom filter size: 128 KB = 1 048 576 bits (16 384 × u64).
 ///
 /// Used to pre-filter the left (probe) side of a Grace Hash Join: any left row
 /// whose join key provably does not exist on the right side is discarded
 /// immediately, without being written to a grace bucket on disk.
 ///
 /// Uses 3 independent hash probes derived from a single `DefaultHasher` call.
-/// False-positive rate for an 8M-bit filter with 3 probes:
-///   - At  50 000 right rows: ≈0.004%  (virtually zero false positives)
-///   - At 500 000 right rows: ≈0.4%    (still excellent)
+/// False-positive rate for a 1M-bit filter with 3 probes:
+///   - At  10 000 right rows: ≈0.002% (virtually zero)
+///   - At  50 000 right rows: ≈0.24%  (excellent)
+///   - At 150 000 right rows: ≈4.2%   (still effective)
 ///
-/// Memory cost: 1 MB — fits comfortably in the 64 MB budget and prevents
-/// millions of unnecessary grace partition disk writes/reads.
-const BLOOM_BITS: usize = 8_388_608;
-const BLOOM_WORDS: usize = BLOOM_BITS / 64; // 131 072 u64s = 1 MB
+/// Memory cost: 128 KB per hash join — with 5 concurrent joins that is 640 KB,
+/// well within the 64 MB budget.
+const BLOOM_BITS: usize = 1_048_576;
+const BLOOM_WORDS: usize = BLOOM_BITS / 64; // 16 384 u64s = 128 KB
 
 struct BloomFilter {
     bits: Vec<u64>,
@@ -243,10 +244,9 @@ where
     // Idempotent: only queries disk if block base hasn't been set yet.
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
-    // 15% of memory limit for the right-side collection budget.
-    // 10% of memory limit — reduced from 15% to allow 4+ nested hash joins
-    // within the 64 MB budget without OOM.
-    let mem_budget       = (memory_limit_mb as usize * 1024 * 1024 * 10) / 100;
+    // Dynamic budget: computed from the global operator count set in main.rs.
+    // Each heavy operator gets an equal share of 50% of the memory limit.
+    let mem_budget       = crate::ops::operator_budget_bytes(memory_limit_mb);
     let bucket_byte_limit = std::cmp::max(1, mem_budget / NUM_BUCKETS);
 
     // ── Bloom Filter: built during right-side collection ─────────────────────
@@ -413,7 +413,7 @@ where
         }
     }
 
-    // Free the 1 MB bloom filter — no longer needed after left-side partitioning.
+    // Free the 128 KB bloom filter — no longer needed after left-side partitioning.
     drop(bloom);
 
     // ── Phase 3: probe bucket by bucket ──────────────────────────────────────

@@ -170,7 +170,7 @@ where
     let mut right_start_block = 0;
     let mut total_right_blocks = 0;
     let mut right_row_buf: Vec<Vec<Data>> = Vec::new();
-    let right_chunk_bytes_limit = (memory_limit_mb as usize * 1024 * 1024 * 8) / 100;
+    let right_chunk_bytes_limit = crate::ops::operator_budget_bytes(memory_limit_mb);
     let mut current_right_bytes = 0;
 
     // Bootstrap allocator safely avoiding borrow interference
@@ -239,7 +239,7 @@ where
     let (inner_in_raw, mut inner_out2) = setup_disk_io();
     let mut inner_buf = BufReader::new(inner_in_raw);
     let mut left_chunk: Vec<Vec<Data>> = Vec::new();
-    let left_chunk_bytes_limit = (memory_limit_mb as usize * 1024 * 1024 * 8) / 100;
+    let left_chunk_bytes_limit = crate::ops::operator_budget_bytes(memory_limit_mb);
     let mut current_left_bytes = 0;
 
     execute_op(

@@ -37,7 +37,7 @@ where
     let num:   u64 = ask_disk_line(disk_out, disk_buf, &format!("get file num-blocks {}\n",  table_id))?.parse()?;
 
     let chunk_blocks = std::cmp::min(
-        256,
+        512,
         std::cmp::max(1, (memory_limit_mb as usize * 1024 * 1024 * 5 / 100) / block_size)
     );
 

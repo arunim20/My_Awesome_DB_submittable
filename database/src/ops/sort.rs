@@ -408,12 +408,12 @@ where
     let mut chunk_bytes: Vec<u8> = Vec::new();
     let mut chunk_index: Vec<ChunkEntry> = Vec::new();
 
-    // 8% of memory_limit — reduced from 12% to allow 4+ nested operators
-    // (e.g. Sort over 3× HashJoin) within the 64 MB budget.
+    // Dynamic budget: computed from the global operator count set in main.rs.
+    // Each heavy operator gets an equal share of 50% of the memory limit.
     // NOTE: main.rs already called set_anon_block_base() before execute_op runs.
     //       Do NOT call get_anon_start_block() or init_anon_block_allocator() here —
     //       that would inject extra IPC commands on the disk pipe mid-execution.
-    let chunk_limit_bytes = (memory_limit_mb as usize * 1024 * 1024 * 8) / 100;
+    let chunk_limit_bytes = crate::ops::operator_budget_bytes(memory_limit_mb);
 
     // Reusable encode buffer to avoid per-row allocations.
     let mut row_encode_buf: Vec<u8> = Vec::new();
