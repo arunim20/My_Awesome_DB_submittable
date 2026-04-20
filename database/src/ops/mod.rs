@@ -14,16 +14,18 @@ pub fn set_heavy_op_count(count: usize) {
 }
 
 /// Per-operator memory budget in bytes.
-/// Formula: available = total − 19 MB overhead − N×128KB bloom.
-/// During flush one operator peaks at 2×, so budget = available / (N+1).
-/// Capped at 15% (the original working hash-join budget).
+/// encode_row_len already accounts for Vec<Data> heap overhead
+/// (40 bytes/element + 64 bytes/Vec), overestimating by ~50%.
+/// At 12% = 7.68MB, actual heap at budget = ~5.1MB.
+/// Grace switch peak = 2 × 5.1MB + 23MB runtime = 33MB < 64MB.
 pub fn operator_budget_bytes(memory_limit_mb: u64) -> usize {
     let count = HEAVY_OP_COUNT.load(Ordering::SeqCst).max(1);
     let total_bytes = memory_limit_mb as usize * 1024 * 1024;
-    let fixed_overhead = 19 * 1024 * 1024 + count * 131072;
+    let fixed_overhead = 19 * 1024 * 1024;
     let available = total_bytes.saturating_sub(fixed_overhead);
     let dynamic = available / (count + 1);
-    let max_budget = total_bytes * 15 / 100;
+    // 12% hard cap: safe for Grace switch with encode_row_len's built-in overhead
+    let max_budget = total_bytes * 12 / 100;
     std::cmp::min(dynamic, max_budget)
 }
 pub mod cross;

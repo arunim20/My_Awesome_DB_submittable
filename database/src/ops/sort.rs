@@ -305,7 +305,6 @@ where
 
             // If chunk reaches byte limit, sort it in memory and flush to scratch disk
             if current_chunk_bytes >= chunk_limit_bytes {
-                // Sort current chunk
                 current_chunk.sort_by(|a, b| {
                     for (idx, ascending) in &sort_keys {
                         let ord = a[*idx]
@@ -321,10 +320,8 @@ where
 
                 let packed = pack_blocks(&current_chunk, block_size).unwrap();
                 let num_blocks = packed.len() / block_size;
-                
                 let run_start = crate::disk::allocate_anon_block_chunk(num_blocks as u64);
                 
-                // We must use a secondary writer to avoid upsetting `disk_out` borrow checker semantics during `execute_op`
                 let mut chunk_out = crate::io_setup::setup_disk_io().1;
                 write_blocks(&mut chunk_out, run_start, num_blocks, &packed).unwrap();
 
@@ -454,6 +451,9 @@ where
             });
         }
     }
+
+    // Rewind anonymous block allocator for next operator
+    crate::disk::rewind_anon_block_allocator();
 
     Ok(schema)
 }

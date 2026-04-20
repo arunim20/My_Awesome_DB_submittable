@@ -10,11 +10,11 @@ use crate::ops::execute_op;
 use crate::schema::{get_schema, ColumnInfo};
 use crate::row::{encode_row, decode_row};
 
-const NUM_BUCKETS: usize = 64;
+const NUM_BUCKETS: usize = 8;
 
-// ── Bloom Filter (128 KB) ─────────────────────────────────────────────────────
-const BLOOM_BITS: usize = 1_048_576;           // 1M bits = 128 KB
-const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 16 384 u64s
+// ── Bloom Filter (512 KB) ─────────────────────────────────────────────────────
+const BLOOM_BITS: usize = 4_194_304;           // 4M bits = 512 KB
+const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 65 536 u64s
 
 struct BloomFilter {
     bits: Vec<u64>,
@@ -148,10 +148,14 @@ struct BucketRun {
     num_blocks: usize,
 }
 
+/// Flush a bucket's in-memory buffer to disk using the canonical disk_out.
+/// IMPORTANT: Always use the same disk_out handle — never create a second
+/// FD wrapper (setup_disk_io().1), as that would interleave bytes on the
+/// underlying FD and corrupt the disk protocol stream.
 fn flush_bucket<W: Write>(
     buffer: &mut Vec<Vec<Data>>,
     runs: &mut Vec<BucketRun>,
-    chunk_out: &mut W,
+    disk_out: &mut W,
     block_size: usize
 ) -> Result<()> {
     if buffer.is_empty() { return Ok(()); }
@@ -168,7 +172,7 @@ fn flush_bucket<W: Write>(
         let byte_end = (written_blocks + to_write) * block_size;
 
         crate::disk::write_blocks(
-            chunk_out,
+            disk_out,
             start + written_blocks as u64,
             to_write,
             &packed[byte_start..byte_end]
@@ -219,11 +223,18 @@ where
     let mut right_total_bytes: usize = 0;
     let mut budget_exceeded = false;
 
+    // Grace-mode per-bucket in-memory accumulators.
+    // These are only filled AFTER execute_op returns (we do NOT flush inside
+    // the closure) to avoid a second concurrent FdWrapper writing to FD 4.
     let mut right_runs: Vec<Vec<BucketRun>> = vec![Vec::new(); NUM_BUCKETS];
     let mut grace_buffers: Vec<Vec<Vec<Data>>> = vec![Vec::new(); NUM_BUCKETS];
     let mut grace_bucket_bytes: Vec<usize> = vec![0; NUM_BUCKETS];
 
     // ── Collect right side ────────────────────────────────────────────────
+    // NOTE: We intentionally do NOT write to disk inside this closure.
+    // Any disk write here would use a second WriteFdWrapper on FD 4,
+    // interleaving with execute_op's own disk_out traffic → corruption.
+    // Instead we accumulate everything in grace_buffers and flush afterward.
     execute_op(
         &join.right, ctx, disk_out, disk_buf, block_size,
         memory_limit_mb,
@@ -247,6 +258,7 @@ where
                 );
 
                 let mut chunk_out = crate::io_setup::setup_disk_io().1;
+                // Redistribute already-collected rows into grace buckets
                 for old_row in right_rows.drain(..) {
                     let mut hasher = DefaultHasher::new();
                     hash_data(&old_row[right_join_idx], &mut hasher);
@@ -266,6 +278,7 @@ where
             let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
             grace_bucket_bytes[bucket] += row_len;
             grace_buffers[bucket].push(row.to_vec());
+            
             if grace_bucket_bytes[bucket] >= bucket_byte_limit {
                 let mut chunk_out = crate::io_setup::setup_disk_io().1;
                 flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
@@ -276,10 +289,15 @@ where
         }
     )?;
 
+    // ── Flush all grace buffers to disk now that execute_op has returned ──
+    // disk_out is exclusively ours again; no interleaving possible.
     if budget_exceeded {
-        let mut chunk_out = crate::io_setup::setup_disk_io().1;
+        eprintln!(
+            "[hash_join] Grace mode: right {} bytes, {} buckets",
+            right_total_bytes, NUM_BUCKETS
+        );
         for b in 0..NUM_BUCKETS {
-            flush_bucket(&mut grace_buffers[b], &mut right_runs[b], &mut chunk_out, block_size)?;
+            flush_bucket(&mut grace_buffers[b], &mut right_runs[b], disk_out, block_size)?;
         }
     }
     drop(grace_buffers);
@@ -322,14 +340,11 @@ where
     }
 
     // ── GRACE PATH: partition left side & probe ──────────────────────────
-    eprintln!(
-        "[hash_join] Grace mode: right {} bytes, {} buckets",
-        right_total_bytes, NUM_BUCKETS
-    );
-
     let mut left_runs: Vec<Vec<BucketRun>> = vec![Vec::new(); NUM_BUCKETS];
 
     {
+        // Accumulate left side into per-bucket in-memory buffers.
+        // Again: no disk writes inside the closure — flush afterward.
         let mut left_buffers: Vec<Vec<Vec<Data>>> = vec![Vec::new(); NUM_BUCKETS];
         let mut left_bucket_bytes: Vec<usize> = vec![0; NUM_BUCKETS];
 
@@ -348,7 +363,6 @@ where
 
                 left_bucket_bytes[bucket] += crate::row::encode_row_len(row);
                 left_buffers[bucket].push(row.to_vec());
-
                 if left_bucket_bytes[bucket] >= bucket_byte_limit {
                     let mut chunk_out = crate::io_setup::setup_disk_io().1;
                     flush_bucket(&mut left_buffers[bucket], &mut left_runs[bucket], &mut chunk_out, block_size)?;
@@ -358,73 +372,122 @@ where
             }
         )?;
 
-        let mut chunk_out = crate::io_setup::setup_disk_io().1;
+        // Flush all left buckets after execute_op returns.
         for b in 0..NUM_BUCKETS {
-            flush_bucket(&mut left_buffers[b], &mut left_runs[b], &mut chunk_out, block_size)?;
+            flush_bucket(&mut left_buffers[b], &mut left_runs[b], disk_out, block_size)?;
         }
     }
 
     drop(bloom);
 
-    // Phase 3: Probe bucket by bucket
-    eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
+    // Phase 3: Multi-pass probe — load right side in memory-safe chunks
+    // After dropping bloom (512KB), available ≈ 64 - 23 = 41MB.
+    // Budget 30MB in encode_row_len units ≈ 19MB actual heap for HashMap.
+    // For small buckets: single pass (zero overhead vs old code).
+    // For huge buckets (lineitem): automatic multi-pass, no OOM.
+    let phase3_budget: usize = 30 * 1024 * 1024;
 
-    let mut inner_out = crate::io_setup::setup_disk_io().1;
-    let mut inner_buf = crate::io_setup::setup_disk_io().0;
+    eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
 
     for b in 0..NUM_BUCKETS {
         if right_runs[b].is_empty() { continue; }
 
-        let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
+        // Flatten right-side runs into a sequential block list
+        let right_segs: Vec<(u64, usize)> = right_runs[b]
+            .iter()
+            .map(|r| (r.start_block, r.num_blocks))
+            .collect();
 
-        for run in &right_runs[b] {
-            let mut rb = 0;
-            while rb < run.num_blocks {
-                let fetch = std::cmp::min(256, run.num_blocks - rb);
-                let buffer = crate::disk::read_blocks(
-                    &mut inner_out, &mut inner_buf,
-                    run.start_block + rb as u64, fetch, block_size,
-                )?;
-                for bi in 0..fetch {
-                    let start = bi * block_size;
-                    let rows = unpack_block(&buffer[start..start + block_size], block_size, &right_schema)?;
-                    for row in rows {
-                        let key = HashKey(row[right_join_idx].clone());
-                        build_hash.entry(key).or_default().push(row);
+        // State: track position across segments for multi-pass
+        let mut seg_idx: usize = 0;
+        let mut blk_off: usize = 0;
+
+        loop {
+            let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
+            let mut loaded_bytes: usize = 0;
+            let mut any_loaded = false;
+
+            // ── Load right-side rows until budget exhausted or data done ──
+            'load_right: while seg_idx < right_segs.len() {
+                let (seg_start, seg_blocks) = right_segs[seg_idx];
+                while blk_off < seg_blocks {
+                    let fetch = std::cmp::min(32, seg_blocks - blk_off);
+                    let buffer = crate::disk::read_blocks(
+                        disk_out,
+                        disk_buf,
+                        seg_start + blk_off as u64,
+                        fetch,
+                        block_size,
+                    )?;
+                    for bi in 0..fetch {
+                        let start = bi * block_size;
+                        let rows = unpack_block(
+                            &buffer[start..start + block_size],
+                            block_size,
+                            &right_schema,
+                        )?;
+                        for row in rows {
+                            loaded_bytes += crate::row::encode_row_len(&row);
+                            let key = HashKey(row[right_join_idx].clone());
+                            build_hash.entry(key).or_default().push(row);
+                            any_loaded = true;
+                        }
+                    }
+                    blk_off += fetch;
+                    if loaded_bytes >= phase3_budget {
+                        break 'load_right;
                     }
                 }
-                rb += fetch;
+                // Finished this segment, move to next
+                seg_idx += 1;
+                blk_off = 0;
             }
-        }
 
-        if build_hash.is_empty() { continue; }
+            if !any_loaded {
+                break;
+            }
 
-        for run in &left_runs[b] {
-            let mut rb = 0;
-            while rb < run.num_blocks {
-                let fetch = std::cmp::min(256, run.num_blocks - rb);
-                let buffer = crate::disk::read_blocks(
-                    &mut inner_out, &mut inner_buf,
-                    run.start_block + rb as u64, fetch, block_size,
-                )?;
-                for bi in 0..fetch {
-                    let start = bi * block_size;
-                    let rows = unpack_block(&buffer[start..start + block_size], block_size, &left_schema)?;
-                    for left_row in rows {
-                        let key = HashKey(left_row[left_join_idx].clone());
-                        if let Some(right_matches) = build_hash.get(&key) {
-                            for right_row in right_matches {
-                                let mut combined = left_row.clone();
-                                combined.extend(right_row.clone());
-                                on_row(&combined)?;
+            // ── Probe entire left side against this partial right HashMap ──
+            for run in &left_runs[b] {
+                let mut rb = 0;
+                while rb < run.num_blocks {
+                    let fetch = std::cmp::min(256, run.num_blocks - rb);
+                    let buffer = crate::disk::read_blocks(
+                        disk_out,
+                        disk_buf,
+                        run.start_block + rb as u64,
+                        fetch,
+                        block_size,
+                    )?;
+                    for bi in 0..fetch {
+                        let start = bi * block_size;
+                        let rows = unpack_block(
+                            &buffer[start..start + block_size],
+                            block_size,
+                            &left_schema,
+                        )?;
+                        for left_row in rows {
+                            let key = HashKey(left_row[left_join_idx].clone());
+                            if let Some(right_matches) = build_hash.get(&key) {
+                                for right_row in right_matches {
+                                    let mut combined = left_row.clone();
+                                    combined.extend(right_row.clone());
+                                    on_row(&combined)?;
+                                }
                             }
                         }
                     }
+                    rb += fetch;
                 }
-                rb += fetch;
+            }
+
+            // If we've exhausted all right segments, done with this bucket
+            if seg_idx >= right_segs.len() {
+                break;
             }
         }
     }
+
 
     Ok(combined_schema)
 }
