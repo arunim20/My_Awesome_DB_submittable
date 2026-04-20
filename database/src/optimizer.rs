@@ -81,49 +81,16 @@ fn reorder_joins(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
                         }
                     }).count();
                     let raw = estimate_cardinality(&tables[i], ctx) as f64;
-                    raw * (0.1_f64).powi(filter_count as i32)
+                    (raw * (0.1_f64).powi(filter_count as i32)).max(1.0)
                 }).collect();
 
-                // ── 4. Greedy join-graph-aware ordering ─────────────────
-                // Always prefer a table that is CONNECTED (has a join edge)
-                // to any table already in the tree. Among candidates, pick
-                // the one with the smallest effective cardinality.
-                let mut used = vec![false; n];
-                let mut order = Vec::with_capacity(n);
-
-                // Seed: smallest effective cardinality
-                let start = (0..n)
-                    .min_by(|&a, &b| effective_cards[a].partial_cmp(&effective_cards[b])
-                        .unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap();
-                used[start] = true;
-                order.push(start);
-
-                for _ in 1..n {
-                    let mut best_connected: Option<(usize, f64)> = None;
-                    let mut best_unconnected: Option<(usize, f64)> = None;
-
-                    for j in 0..n {
-                        if used[j] { continue; }
-                        let connected = order.iter().any(|&k| join_edges[j][k]);
-                        let score = effective_cards[j];
-
-                        if connected {
-                            if best_connected.is_none() || score < best_connected.unwrap().1 {
-                                best_connected = Some((j, score));
-                            }
-                        } else {
-                            if best_unconnected.is_none() || score < best_unconnected.unwrap().1 {
-                                best_unconnected = Some((j, score));
-                            }
-                        }
-                    }
-
-                    let next = if let Some((j, _)) = best_connected { j }
-                               else { best_unconnected.unwrap().0 };
-                    used[next] = true;
-                    order.push(next);
-                }
+                // ── 4. Exhaustive bitmask-DP join ordering ──────────────
+                // For N ≤ 10 tables, enumerate all 2^N subsets (≤1024) and
+                // find the left-deep ordering that minimises total
+                // intermediate cardinality.  Any step requiring a Cross Join
+                // (no equi-join predicate) gets a huge penalty, so the DP
+                // naturally avoids Cartesian products.
+                let order = find_best_join_order(n, &join_edges, &effective_cards);
 
                 // ── 5. Logging ──────────────────────────────────────────
                 for &idx in &order {
@@ -623,28 +590,114 @@ pub fn estimate_cardinality(op: &QueryOp, ctx: &DbContext) -> usize {
     }
 }
 
-/// Compute the maximum number of memory-heavy operators (HashJoin, Sort, Cross)
-/// that can be alive simultaneously on the Rust call stack during execution.
-///
-/// For binary operators (HashJoin, Cross), the right child is fully executed
-/// first, then the left child is streamed.  At any moment only ONE child is
-/// active alongside the parent, so we take `max(left_depth, right_depth)`.
-///
-/// This drives the dynamic per-operator memory budget in `ops::mod.rs`.
+// ── Exhaustive bitmask-DP join ordering ───────────────────────────────────────
+//
+// For N tables, enumerate all 2^N subsets.  For each subset S and each table t
+// not yet in S, compute the cost of extending S by t.
+//
+// Cost model:
+//   • Equi-join (t has a join edge to some table in S):
+//       result_card = max(card_S, card_t)           – FK-join heuristic
+//   • Cross join (no edge):
+//       result_card = card_S × card_t               – massive penalty
+//
+// Total cost = sum of result cardinalities at each join step.
+// The ordering with minimum total cost is chosen.
+//
+// Complexity: O(2^N × N) ≈ 10 240 for N = 10.  Instant.
+
+fn find_best_join_order(
+    n: usize,
+    join_edges: &[Vec<bool>],
+    effective_cards: &[f64],
+) -> Vec<usize> {
+    if n <= 1 {
+        return (0..n).collect();
+    }
+
+    let full_mask = (1usize << n) - 1;
+
+    // dp[mask] = (total_cost, result_cardinality, last_table_added)
+    let mut dp: Vec<Option<(f64, f64, usize)>> = vec![None; 1 << n];
+
+    // Base cases: single tables
+    for i in 0..n {
+        dp[1 << i] = Some((effective_cards[i], effective_cards[i], i));
+    }
+
+    // Fill DP in order of increasing mask value (smaller subsets first)
+    for mask in 1..=full_mask {
+        let (total_cost, result_card, _) = match dp[mask] {
+            Some(e) => e,
+            None => continue,
+        };
+
+        for t in 0..n {
+            if mask & (1 << t) != 0 { continue; } // already in set
+
+            let new_mask = mask | (1 << t);
+            let t_card = effective_cards[t];
+
+            // Check if t has an equi-join edge to ANY table already in mask
+            let connected = (0..n).any(|k| mask & (1 << k) != 0 && join_edges[k][t]);
+
+            let new_result_card = if connected {
+                result_card.max(t_card) // FK-join: result ≈ larger side
+            } else {
+                result_card * t_card    // Cross join: Cartesian blowup
+            };
+
+            // Massive additive penalty for cross joins — the DP will
+            // NEVER choose a cross join when any equi-join path exists.
+            let cost_contribution = if connected {
+                new_result_card
+            } else {
+                new_result_card + 1e15
+            };
+
+            let new_total_cost = total_cost + cost_contribution;
+
+            let update = match dp[new_mask] {
+                None => true,
+                Some((existing_cost, _, _)) => new_total_cost < existing_cost,
+            };
+
+            if update {
+                dp[new_mask] = Some((new_total_cost, new_result_card, t));
+            }
+        }
+    }
+
+    // Backtrack to reconstruct the optimal ordering
+    let mut order = Vec::with_capacity(n);
+    let mut mask = full_mask;
+    while mask != 0 {
+        let (_, _, last) = dp[mask].unwrap();
+        order.push(last);
+        mask ^= 1 << last;
+    }
+    order.reverse();
+
+    eprintln!("[optimizer] DP join order cost = {:.0}", dp[(1 << n) - 1].unwrap().0);
+    order
+}
+
+/// Count the maximum number of memory-heavy operators (HashJoin, Sort, Cross)
+/// alive simultaneously on the call stack during execution.
 pub fn max_concurrent_heavy_ops(op: &QueryOp) -> usize {
     match op {
         QueryOp::HashJoin(h) => {
-            let l = max_concurrent_heavy_ops(&h.left);
-            let r = max_concurrent_heavy_ops(&h.right);
-            1 + std::cmp::max(l, r)
+            1 + std::cmp::max(
+                max_concurrent_heavy_ops(&h.left),
+                max_concurrent_heavy_ops(&h.right),
+            )
         }
-        QueryOp::Sort(s) => {
-            1 + max_concurrent_heavy_ops(&s.underlying)
-        }
+        QueryOp::Sort(s) => 1 + max_concurrent_heavy_ops(&s.underlying),
         QueryOp::Cross(c) => {
-            let l = max_concurrent_heavy_ops(&c.left);
-            let r = max_concurrent_heavy_ops(&c.right);
-            1 + std::cmp::max(l, r)
+            1 + std::cmp::max(
+                max_concurrent_heavy_ops(&c.left),
+                max_concurrent_heavy_ops(&c.right),
+            )
         }
         QueryOp::Filter(f) => max_concurrent_heavy_ops(&f.underlying),
         QueryOp::Project(p) => max_concurrent_heavy_ops(&p.underlying),
