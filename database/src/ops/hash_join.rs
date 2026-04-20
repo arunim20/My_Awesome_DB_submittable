@@ -381,11 +381,9 @@ where
     drop(bloom);
 
     // Phase 3: Multi-pass probe — load right side in memory-safe chunks
-    // After dropping bloom (512KB), available ≈ 64 - 23 = 41MB.
-    // Budget 30MB in encode_row_len units ≈ 19MB actual heap for HashMap.
-    // For small buckets: single pass (zero overhead vs old code).
-    // For huge buckets (lineitem): automatic multi-pass, no OOM.
-    let phase3_budget: usize = 30 * 1024 * 1024;
+    // Budget 20MB in encode_row_len units to prevent allocator fragmentation
+    // or HashMap virtual memory resizing from blowing the strict 64MB total limit.
+    let phase3_budget: usize = 20 * 1024 * 1024;
 
     eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
 

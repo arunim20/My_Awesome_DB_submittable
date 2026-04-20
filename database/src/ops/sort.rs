@@ -390,7 +390,7 @@ where
 
     eprintln!("[sort] merging {} spilled runs", runs.len());
 
-    const MAX_MERGE_WIDTH: usize = 64;
+    const MAX_MERGE_WIDTH: usize = 32;
 
     // Cascading merge: if too many runs for a single merge pass, merge in
     // groups of MAX_MERGE_WIDTH, producing fewer intermediate runs, and repeat
