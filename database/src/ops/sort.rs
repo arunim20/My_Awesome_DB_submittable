@@ -303,7 +303,9 @@ where
             current_chunk_bytes += row_len;
             current_chunk.push(row.to_vec());
 
-            // If chunk reaches byte limit, sort it in memory and flush to scratch disk
+            // If chunk reaches byte limit, sort it in memory and flush to scratch disk.
+            // chunk_out is safe here: on_row is called between block-read cycles,
+            // so disk_out is not mid-response and chunk_out writes cleanly.
             if current_chunk_bytes >= chunk_limit_bytes {
                 current_chunk.sort_by(|a, b| {
                     for (idx, ascending) in &sort_keys {
@@ -321,15 +323,10 @@ where
                 let packed = pack_blocks(&current_chunk, block_size).unwrap();
                 let num_blocks = packed.len() / block_size;
                 let run_start = crate::disk::allocate_anon_block_chunk(num_blocks as u64);
-                
                 let mut chunk_out = crate::io_setup::setup_disk_io().1;
                 write_blocks(&mut chunk_out, run_start, num_blocks, &packed).unwrap();
 
-                runs.push(Run {
-                    start_block: run_start,
-                    num_blocks,
-                });
-
+                runs.push(Run { start_block: run_start, num_blocks });
                 current_chunk.clear();
                 current_chunk_bytes = 0;
             }
