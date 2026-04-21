@@ -221,9 +221,8 @@ where
 
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
-    // Dynamic budget
-    let mem_budget = crate::ops::operator_budget_bytes(memory_limit_mb);
-    let bucket_byte_limit = std::cmp::max(1, mem_budget / NUM_BUCKETS);
+    // Budget is recomputed dynamically inside closures so it adapts
+    // as inner operators start/stop (live count changes).
 
     // Bloom filter: built during right-side collection
     let mut bloom = BloomFilter::new();
@@ -247,7 +246,8 @@ where
             right_total_bytes += row_len;
             bloom.insert(&row[right_join_idx]);
 
-            if !budget_exceeded && right_total_bytes <= mem_budget {
+            let cur_budget = crate::ops::operator_budget_bytes(memory_limit_mb);
+            if !budget_exceeded && right_total_bytes <= cur_budget {
                 right_rows.push(row.to_vec());
                 return Ok(());
             }
@@ -256,7 +256,7 @@ where
                 budget_exceeded = true;
                 eprintln!(
                     "[hash_join] Grace switch at {} bytes (budget {})",
-                    right_total_bytes, mem_budget
+                    right_total_bytes, cur_budget
                 );
                 // Redistribute already-collected rows into buckets, flushing overflows
                 for old_row in right_rows.drain(..) {
@@ -265,7 +265,7 @@ where
                     let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
                     grace_bucket_bytes[bucket] += crate::row::encode_row_len(&old_row);
                     grace_buffers[bucket].push(old_row);
-                    if grace_bucket_bytes[bucket] >= bucket_byte_limit {
+                    if grace_bucket_bytes[bucket] >= std::cmp::max(1, cur_budget / NUM_BUCKETS) {
                         let mut chunk_out = crate::io_setup::setup_disk_io().1;
                         flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
                         grace_bucket_bytes[bucket] = 0;
@@ -280,7 +280,7 @@ where
             grace_bucket_bytes[bucket] += row_len;
             grace_buffers[bucket].push(row.to_vec());
             // Flush bucket if it overflows — chunk_out safe between block-read cycles
-            if grace_bucket_bytes[bucket] >= bucket_byte_limit {
+            if grace_bucket_bytes[bucket] >= std::cmp::max(1, cur_budget / NUM_BUCKETS) {
                 let mut chunk_out = crate::io_setup::setup_disk_io().1;
                 flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
                 grace_bucket_bytes[bucket] = 0;
@@ -306,7 +306,7 @@ where
     if !budget_exceeded {
         eprintln!(
             "[hash_join] In-memory: {} right rows ({} bytes, budget {})",
-            right_rows.len(), right_total_bytes, mem_budget
+            right_rows.len(), right_total_bytes, crate::ops::operator_budget_bytes(memory_limit_mb)
         );
 
         let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
@@ -366,7 +366,7 @@ where
             grace_l_bytes[b] += crate::row::encode_row_len(row);
             grace_l_bufs[b].push(row.to_vec());
             // Flush bucket if it overflows — chunk_out is safe (between block-read cycles)
-            if grace_l_bytes[b] >= bucket_byte_limit {
+            if grace_l_bytes[b] >= std::cmp::max(1, crate::ops::operator_budget_bytes(memory_limit_mb) / NUM_BUCKETS) {
                 let mut chunk_out = crate::io_setup::setup_disk_io().1;
                 flush_bucket(&mut grace_l_bufs[b], &mut left_runs[b], &mut chunk_out, block_size)?;
                 grace_l_bytes[b] = 0;
@@ -386,8 +386,8 @@ where
     drop(grace_l_bufs);
     drop(grace_l_bytes);
 
-    // Phase 3: grace bufs and bloom are already freed — use full mem_budget
-    let phase3_budget: usize = mem_budget;
+    // Phase 3: all other operators dropped — recompute fresh budget
+    let phase3_budget = crate::ops::operator_budget_bytes(memory_limit_mb);
 
     eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
 

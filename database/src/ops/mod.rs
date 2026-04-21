@@ -53,12 +53,13 @@ pub fn set_heavy_op_count(count: usize) {
 pub fn operator_budget_bytes(memory_limit_mb: u64) -> usize {
     let live = LIVE_HEAVY_OPS.with(|c| c.get()).max(1);
     let total_bytes = memory_limit_mb as usize * 1024 * 1024;
-    // Fixed overhead: cache (4MB) + bloom filters (~0.5MB) + HashMap overhead + OS/stack
-    let fixed_overhead = 12 * 1024 * 1024;
+    // Fixed overhead: cache (4MB) + process baseline (binary+stack+libc ~10MB)
+    // + bloom filters + HashMap amplification headroom (6MB)
+    let fixed_overhead = 20 * 1024 * 1024;
     let available = total_bytes.saturating_sub(fixed_overhead);
     let dynamic = available / (live + 1);
-    // Cap at 40% of total — generous but safe with the (live+1) divisor
-    let max_budget = total_bytes * 40 / 100;
+    // Cap at 30% of total — conservative to prevent sort flush peak OOM
+    let max_budget = total_bytes * 30 / 100;
     std::cmp::min(dynamic, max_budget)
 }
 
