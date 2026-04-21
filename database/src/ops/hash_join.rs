@@ -19,9 +19,9 @@ thread_local! {
     pub static GLOBAL_BLOOM: RefCell<Vec<(String, Rc<BloomFilter>)>> = RefCell::new(Vec::new());
 }
 
-// ── Bloom Filter (512 KB) ─────────────────────────────────────────────────────
-const BLOOM_BITS: usize = 4_194_304;           // 4M bits = 512 KB
-const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 65 536 u64s
+// ── Bloom Filter (64 KB) ──────────────────────────────────────────────────────
+const BLOOM_BITS: usize = 524_288;             // 512K bits = 64 KB
+const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 8 192 u64s
 
 pub struct BloomFilter {
     pub bits: Vec<u64>,
@@ -205,6 +205,8 @@ where
     W: Write,
     R: Read + BufRead,
 {
+    let _guard = crate::ops::enter_heavy_op();
+
     let left_schema = get_schema(&join.left, ctx)?;
     let right_schema = get_schema(&join.right, ctx)?;
 

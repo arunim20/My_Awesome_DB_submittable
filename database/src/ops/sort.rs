@@ -268,6 +268,8 @@ where
     W: Write,
     R: Read + BufRead,
 {
+    let _guard = crate::ops::enter_heavy_op();
+
     let schema = crate::schema::get_schema(&sort.underlying, ctx)?;
     let sort_keys: Vec<(usize, bool)> = sort
         .sort_specs

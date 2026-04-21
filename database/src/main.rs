@@ -69,7 +69,7 @@ fn db_main() -> Result<()> {
     let memory_limit_mb: u64 = input_line.trim().parse()?;
     eprintln!("Memory limit: {} MB", memory_limit_mb);
 
-    let cache_limit_bytes = 10 * 1024 * 1024;
+    let cache_limit_bytes = 4 * 1024 * 1024;
     crate::disk::set_cache_limit(cache_limit_bytes);
     eprintln!("Setting Cache Buffer to {} MB", cache_limit_bytes / 1024 / 1024);
 
