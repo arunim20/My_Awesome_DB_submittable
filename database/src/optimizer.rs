@@ -253,6 +253,33 @@ fn optimize_join_order(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
     }
 }
 
+fn produces_ordered_stream(op: &QueryOp, col_name: &str, ctx: &DbContext) -> bool {
+    match op {
+        QueryOp::Scan(s) => {
+            if let Some(spec) = ctx.get_table_specs().iter().find(|t| t.file_id == s.table_id) {
+                if let Some(col_spec) = spec.column_specs.iter().find(|c| c.column_name == col_name) {
+                    if let Some(stats) = &col_spec.stats {
+                        return stats.iter().any(|st| matches!(st, db_config::statistics::ColumnStat::IsPhysicallyOrdered));
+                    }
+                }
+            }
+            false
+        }
+        QueryOp::Filter(f) => produces_ordered_stream(&*f.underlying, col_name, ctx),
+        QueryOp::Project(p) => {
+            let mut underlying_col = col_name.to_string();
+            for (from, to) in &p.column_name_map {
+                if to == col_name {
+                    underlying_col = from.clone();
+                    break;
+                }
+            }
+            produces_ordered_stream(&*p.underlying, &underlying_col, ctx)
+        }
+        _ => false,
+    }
+}
+
 fn optimize_rewrites(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
     match op {
         QueryOp::Filter(mut f) => {
@@ -371,11 +398,20 @@ fn optimize_rewrites(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
             Ok(QueryOp::Filter(f))
         }
         QueryOp::Sort(mut s) => {
-            s.underlying = Box::new(optimize_rewrites(*s.underlying, ctx)?);
+            let optimized_underlying = optimize_rewrites(*s.underlying, ctx)?;
 
             // Sort elision (Sort -> Sort) => Outer Sort wins
-            if let QueryOp::Sort(inner_sort) = *s.underlying {
-                s.underlying = inner_sort.underlying; // drop the inner sort completely
+            s.underlying = match optimized_underlying {
+                QueryOp::Sort(inner_sort) => inner_sort.underlying,
+                other => Box::new(other),
+            };
+
+            // IsPhysicallyOrdered Elision via stats
+            if let Some(first_sort) = s.sort_specs.first() {
+                if first_sort.ascending && produces_ordered_stream(&*s.underlying, &first_sort.column_name, ctx) {
+                    eprintln!("[optimizer] Eliding sort on {} (IsPhysicallyOrdered)", first_sort.column_name);
+                    return Ok(*s.underlying);
+                }
             }
 
             Ok(QueryOp::Sort(s))

@@ -12,20 +12,27 @@ use crate::row::{encode_row, decode_row};
 
 const NUM_BUCKETS: usize = 8;
 
+use std::rc::Rc;
+use std::cell::RefCell;
+
+thread_local! {
+    pub static GLOBAL_BLOOM: RefCell<Vec<(String, Rc<BloomFilter>)>> = RefCell::new(Vec::new());
+}
+
 // ── Bloom Filter (512 KB) ─────────────────────────────────────────────────────
 const BLOOM_BITS: usize = 4_194_304;           // 4M bits = 512 KB
 const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 65 536 u64s
 
-struct BloomFilter {
-    bits: Vec<u64>,
+pub struct BloomFilter {
+    pub bits: Vec<u64>,
 }
 
 impl BloomFilter {
-    fn new() -> Self {
+    pub fn new() -> Self {
         BloomFilter { bits: vec![0u64; BLOOM_WORDS] }
     }
 
-    fn bit_positions(key: &Data) -> [usize; 3] {
+    pub fn bit_positions(key: &Data) -> [usize; 3] {
         let mut h = DefaultHasher::new();
         hash_data(key, &mut h);
         let h1 = h.finish();
@@ -38,14 +45,14 @@ impl BloomFilter {
         ]
     }
 
-    fn insert(&mut self, key: &Data) {
+    pub fn insert(&mut self, key: &Data) {
         for pos in Self::bit_positions(key) {
             self.bits[pos >> 6] |= 1u64 << (pos & 63);
         }
     }
 
     #[inline]
-    fn might_contain(&self, key: &Data) -> bool {
+    pub fn might_contain(&self, key: &Data) -> bool {
         for pos in Self::bit_positions(key) {
             if self.bits[pos >> 6] & (1u64 << (pos & 63)) == 0 {
                 return false;
@@ -290,7 +297,6 @@ where
     )?;
 
     // ── Flush all grace buffers to disk now that execute_op has returned ──
-    // disk_out is exclusively ours again; no interleaving possible.
     if budget_exceeded {
         eprintln!(
             "[hash_join] Grace mode: right {} bytes, {} buckets",
@@ -316,12 +322,17 @@ where
             build_hash.entry(key).or_default().push(row);
         }
 
+        let bloom_rc = Rc::new(bloom);
+        GLOBAL_BLOOM.with(|g| {
+            g.borrow_mut().push((join.left_join_col.clone(), bloom_rc.clone()));
+        });
+
         execute_op(
             &join.left, ctx, disk_out, disk_buf, block_size,
             memory_limit_mb,
             &mut |left_row| {
                 // Bloom filter: skip if definitely no match
-                if !bloom.might_contain(&left_row[left_join_idx]) {
+                if !bloom_rc.might_contain(&left_row[left_join_idx]) {
                     return Ok(());
                 }
                 let key = HashKey(left_row[left_join_idx].clone());
@@ -336,15 +347,20 @@ where
             }
         )?;
 
+        GLOBAL_BLOOM.with(|g| { g.borrow_mut().pop(); });
         return Ok(combined_schema);
     }
+    
+    let bloom_rc = Rc::new(bloom);
+    GLOBAL_BLOOM.with(|g| {
+        g.borrow_mut().push((join.left_join_col.clone(), bloom_rc.clone()));
+    });
 
     // ── GRACE PATH: partition left side & probe ──────────────────────────
     let mut left_runs: Vec<Vec<BucketRun>> = vec![Vec::new(); NUM_BUCKETS];
 
     {
         // Accumulate left side into per-bucket in-memory buffers.
-        // Again: no disk writes inside the closure — flush afterward.
         let mut left_buffers: Vec<Vec<Vec<Data>>> = vec![Vec::new(); NUM_BUCKETS];
         let mut left_bucket_bytes: Vec<usize> = vec![0; NUM_BUCKETS];
 
@@ -353,7 +369,7 @@ where
             memory_limit_mb,
             &mut |row| {
                 // Bloom filter: skip rows that definitely have no match
-                if !bloom.might_contain(&row[left_join_idx]) {
+                if !bloom_rc.might_contain(&row[left_join_idx]) {
                     return Ok(());
                 }
 
@@ -372,22 +388,22 @@ where
             }
         )?;
 
-        // Flush all left buckets after execute_op returns.
+        // Flush all left buckets (0..NUM_BUCKETS)
         for b in 0..NUM_BUCKETS {
             flush_bucket(&mut left_buffers[b], &mut left_runs[b], disk_out, block_size)?;
         }
     }
 
-    drop(bloom);
+    drop(bloom_rc);
+    GLOBAL_BLOOM.with(|g| { g.borrow_mut().pop(); });
 
-    // Phase 3: Multi-pass probe — load right side in memory-safe chunks
-    // Budget 20MB in encode_row_len units to prevent allocator fragmentation
-    // or HashMap virtual memory resizing from blowing the strict 64MB total limit.
-    let phase3_budget: usize = 20 * 1024 * 1024;
+    // Phase 3: Hash map allocates dynamically tracking pointers, requiring 2x buffer margin
+    let phase3_budget: usize = mem_budget / 2;
 
     eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
 
     for b in 0..NUM_BUCKETS {
+
         if right_runs[b].is_empty() { continue; }
 
         // Flatten right-side runs into a sequential block list
@@ -479,7 +495,6 @@ where
                 }
             }
 
-            // If we've exhausted all right segments, done with this bucket
             if seg_idx >= right_segs.len() {
                 break;
             }

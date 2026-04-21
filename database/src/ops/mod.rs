@@ -24,7 +24,6 @@ pub fn operator_budget_bytes(memory_limit_mb: u64) -> usize {
     let fixed_overhead = 19 * 1024 * 1024;
     let available = total_bytes.saturating_sub(fixed_overhead);
     let dynamic = available / (count + 1);
-    // 12% hard cap: safe for Grace switch with encode_row_len's built-in overhead
     let max_budget = total_bytes * 12 / 100;
     std::cmp::min(dynamic, max_budget)
 }

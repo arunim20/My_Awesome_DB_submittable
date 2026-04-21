@@ -452,8 +452,7 @@ where
         }
     }
 
-    // Rewind anonymous block allocator for next operator
-    crate::disk::rewind_anon_block_allocator();
+    // Rewind anonymous block allocator for next operator - REMOVED TO PREVENT CORRUPTION
 
     Ok(schema)
 }

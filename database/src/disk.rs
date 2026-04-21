@@ -14,7 +14,7 @@ pub fn ask_disk_line<R: BufRead>(
     Ok(line.trim().to_string())
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 static NEXT_ANON_BLOCK: AtomicU64 = AtomicU64::new(0);
@@ -32,7 +32,12 @@ struct CacheEntry {
 
 static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
 static CACHE_SIZE_BYTES: Mutex<usize> = Mutex::new(0);
-const CACHE_LIMIT_BYTES: usize = 4 * 1024 * 1024; // 4MB — must stay low to fit in 64MB RLIMIT_AS
+static CACHE_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(4 * 1024 * 1024);
+
+pub fn set_cache_limit(limit_bytes: usize) {
+    CACHE_LIMIT_BYTES.store(limit_bytes, Ordering::SeqCst);
+}
+
 
 pub fn read_blocks<R: Read>(
     disk_out: &mut impl Write,
@@ -59,14 +64,16 @@ pub fn read_blocks<R: Read>(
     {
         let mut cache = CACHE.lock().unwrap();
         let mut size = CACHE_SIZE_BYTES.lock().unwrap();
+        let limit = CACHE_LIMIT_BYTES.load(Ordering::SeqCst);
         
-        while *size + buf.len() > CACHE_LIMIT_BYTES && !cache.is_empty() {
+        while *size + buf.len() > limit && !cache.is_empty() {
             let removed = cache.pop().unwrap();
             *size -= removed.data.len();
         }
         
-        if buf.len() <= CACHE_LIMIT_BYTES {
-            cache.insert(0, CacheEntry {
+        if buf.len() <= limit {
+            let midpoint = cache.len() / 2;
+            cache.insert(midpoint, CacheEntry {
                 start_block_id,
                 num_blocks,
                 data: buf.clone(),
@@ -102,27 +109,6 @@ pub fn allocate_anon_block_chunk(num_blocks: u64) -> u64 {
     NEXT_ANON_BLOCK.fetch_add(num_blocks, Ordering::SeqCst)
 }
 
-pub fn rewind_anon_block_allocator() {
-    let base = BASE_ANON_BLOCK.load(Ordering::SeqCst);
-    if base > 0 {
-        NEXT_ANON_BLOCK.store(base, Ordering::SeqCst);
-
-        // Bulletproof Cache Correctness: Remove cached anonymous blocks so that they don't accidentally
-        // serve stale mismatched-chunk data to the next operator reusing this space.
-        let mut cache = CACHE.lock().unwrap();
-        let mut size = CACHE_SIZE_BYTES.lock().unwrap();
-        
-        cache.retain(|e| {
-            if e.start_block_id >= base {
-                *size -= e.data.len();
-                false // remove
-            } else {
-                true // keep base table chunks safely!
-            }
-        });
-    }
-}
-
 pub fn write_blocks(
     disk_out: &mut impl Write,
     start_block_id: u64,
@@ -136,18 +122,19 @@ pub fn write_blocks(
     {
         let mut cache = CACHE.lock().unwrap();
         let mut size = CACHE_SIZE_BYTES.lock().unwrap();
+        let limit = CACHE_LIMIT_BYTES.load(Ordering::SeqCst);
         
         if let Some(idx) = cache.iter().position(|e| e.start_block_id == start_block_id && e.num_blocks == num_blocks) {
             let removed = cache.remove(idx);
             *size -= removed.data.len();
         }
 
-        while *size + data.len() > CACHE_LIMIT_BYTES && !cache.is_empty() {
+        while *size + data.len() > limit && !cache.is_empty() {
             let removed = cache.pop().unwrap();
             *size -= removed.data.len();
         }
         
-        if data.len() <= CACHE_LIMIT_BYTES {
+        if data.len() <= limit {
             cache.insert(0, CacheEntry {
                 start_block_id,
                 num_blocks,
