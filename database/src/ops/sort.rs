@@ -290,7 +290,6 @@ where
     // Stream the data
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
-    let chunk_limit_bytes = crate::ops::operator_budget_bytes(memory_limit_mb);
     let mut current_chunk_bytes = 0;
 
     execute_op(
@@ -305,10 +304,11 @@ where
             current_chunk_bytes += row_len;
             current_chunk.push(row.to_vec());
 
-            // If chunk reaches byte limit, sort it in memory and flush to scratch disk.
-            // chunk_out is safe here: on_row is called between block-read cycles,
-            // so disk_out is not mid-response and chunk_out writes cleanly.
-            if current_chunk_bytes >= chunk_limit_bytes {
+            // Recompute budget dynamically: as inner operators start (live count
+            // increases), the threshold shrinks, causing earlier flush. This
+            // prevents sort from hogging 28MB while joins also need memory.
+            let chunk_limit = crate::ops::operator_budget_bytes(memory_limit_mb);
+            if current_chunk_bytes >= chunk_limit {
                 current_chunk.sort_by(|a, b| {
                     for (idx, ascending) in &sort_keys {
                         let ord = a[*idx]
