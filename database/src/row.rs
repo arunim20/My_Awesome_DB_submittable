@@ -4,22 +4,6 @@ use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 
 use crate::schema::ColumnInfo;
 
-/// Skip over bytes for a column without allocating/decoding it.
-#[inline(always)]
-fn skip_column(data: &[u8], offset: usize, dt: &DataType) -> Result<usize> {
-    Ok(match dt {
-        DataType::Int32 | DataType::Float32 => offset + 4,
-        DataType::Int64 | DataType::Float64 => offset + 8,
-        DataType::String => {
-            let end = data[offset..]
-                .iter()
-                .position(|&b| b == 0)
-                .context("Null terminator not found while skipping string column")?;
-            offset + end + 1
-        }
-    })
-}
-
 pub fn decode_row(data: &[u8], mut offset: usize, schema: &[ColumnInfo]) -> Result<(Vec<Data>, usize)> {
     let mut row = Vec::with_capacity(schema.len());
     for col in schema {
@@ -53,63 +37,6 @@ pub fn decode_row(data: &[u8], mut offset: usize, schema: &[ColumnInfo]) -> Resu
                 row.push(Data::String(s));
                 offset += end + 1;
             }
-        }
-    }
-    Ok((row, offset))
-}
-
-/// Decode only the columns in `keep_indices` (sorted ascending), skipping all others.
-/// Returns a Vec<Data> of length `keep_indices.len()` in the same order.
-/// This is the **Aggressive Column-Skip Decoding** optimization: avoids all String
-/// allocations for unrequested columns, shrinking tuple heap size by 60-80% on
-/// wide tables like lineitem (16 columns) when only 2-3 are needed.
-pub fn decode_row_projected(
-    data: &[u8],
-    mut offset: usize,
-    schema: &[ColumnInfo],
-    keep_indices: &[usize],  // sorted ascending
-) -> Result<(Vec<Data>, usize)> {
-    let mut row = Vec::with_capacity(keep_indices.len());
-    let mut keep_iter = keep_indices.iter().peekable();
-
-    for (i, col) in schema.iter().enumerate() {
-        if keep_iter.peek() == Some(&&i) {
-            // Decode this column — it's needed
-            match col.data_type {
-                DataType::Int32 => {
-                    let bytes: [u8; 4] = data[offset..offset + 4].try_into()?;
-                    row.push(Data::Int32(i32::from_le_bytes(bytes)));
-                    offset += 4;
-                }
-                DataType::Int64 => {
-                    let bytes: [u8; 8] = data[offset..offset + 8].try_into()?;
-                    row.push(Data::Int64(i64::from_le_bytes(bytes)));
-                    offset += 8;
-                }
-                DataType::Float32 => {
-                    let bytes: [u8; 4] = data[offset..offset + 4].try_into()?;
-                    row.push(Data::Float32(f32::from_le_bytes(bytes)));
-                    offset += 4;
-                }
-                DataType::Float64 => {
-                    let bytes: [u8; 8] = data[offset..offset + 8].try_into()?;
-                    row.push(Data::Float64(f64::from_le_bytes(bytes)));
-                    offset += 8;
-                }
-                DataType::String => {
-                    let end = data[offset..]
-                        .iter()
-                        .position(|&b| b == 0)
-                        .context("Null terminator not found in string column")?;
-                    let s = std::str::from_utf8(&data[offset..offset + end])?.to_string();
-                    row.push(Data::String(s));
-                    offset += end + 1;
-                }
-            }
-            keep_iter.next();
-        } else {
-            // Skip this column — zero allocation
-            offset = skip_column(data, offset, &col.data_type)?;
         }
     }
     Ok((row, offset))
@@ -254,11 +181,14 @@ pub fn apply_split_predicates(
                 };
                 compare_data(val, &pred.operator, other_val)
             }
-            ComparisionValue::I32(v) => compare_data(val, &pred.operator, &Data::Int32(*v)),
-            ComparisionValue::I64(v) => compare_data(val, &pred.operator, &Data::Int64(*v)),
-            ComparisionValue::F32(v) => compare_data(val, &pred.operator, &Data::Float32(*v)),
-            ComparisionValue::F64(v) => compare_data(val, &pred.operator, &Data::Float64(*v)),
-            ComparisionValue::String(v) => compare_data(val, &pred.operator, &Data::String(v.clone())),
+            literal => {
+                let target_type = &schema[col_idx].data_type;
+                if let Some(coerced) = coerce_literal(literal, target_type) {
+                    compare_data(val, &pred.operator, &coerced)
+                } else {
+                    false
+                }
+            }
         };
 
         if !result {

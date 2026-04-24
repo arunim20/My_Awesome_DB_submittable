@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use common::query::{ProjectData, QueryOp};
+use common::query::ProjectData;
 use common::{Data, DataType};
 use db_config::DbContext;
 use std::io::{BufRead, Read, Write};
@@ -35,47 +35,6 @@ where
         })
         .collect::<Result<_>>()?;
 
-    // ── Optimization: Project(Scan) fusion ───────────────────────────────────
-    // When the direct child is a Scan, we can skip decoding unused columns
-    // entirely at the block level using decode_row_projected, avoiding all
-    // heap allocations for dropped columns.
-    if let QueryOp::Scan(scan_data) = &*project.underlying {
-        let mut keep_indices: Vec<usize> = projections.iter().map(|(i, _, _)| *i).collect();
-        keep_indices.sort_unstable();
-        keep_indices.dedup();
-
-        // Map original index -> position in keep_indices for output reordering
-        let pos_map: Vec<usize> = projections
-            .iter()
-            .map(|(orig_idx, _, _)| keep_indices.iter().position(|&k| k == *orig_idx).unwrap())
-            .collect();
-
-        let out_schema: Vec<ColumnInfo> = projections
-            .iter()
-            .map(|(_, name, dt)| ColumnInfo { name: name.clone(), data_type: dt.clone() })
-            .collect();
-
-        crate::ops::scan::execute_scan_with_opts(
-            &scan_data.table_id,
-            ctx,
-            disk_out,
-            disk_buf,
-            block_size,
-            memory_limit_mb,
-            Some(&keep_indices),
-            None,
-            &mut |decoded_row| {
-                // decoded_row has keep_indices.len() elements in keep_indices order
-                // We need to reorder to match projections order
-                let reordered: Vec<Data> = pos_map.iter().map(|&p| decoded_row[p].clone()).collect();
-                on_row(&reordered)
-            },
-        )?;
-
-        return Ok(out_schema);
-    }
-
-    // ── Default path: Project over arbitrary child ────────────────────────────
     execute_op(
         &project.underlying,
         ctx,

@@ -49,8 +49,8 @@ impl RunStreamer {
             return Ok(None);
         }
 
-        // Read up to 32 blocks at once — amortises seek penalty
-        let fetch = std::cmp::min(32, self.run.num_blocks - self.current_block_idx);
+        // Read up to 8 blocks at once — amortises seek penalty while saving memory
+        let fetch = std::cmp::min(8, self.run.num_blocks - self.current_block_idx);
         let block_data = read_blocks(
             disk_out,
             disk_raw,
@@ -268,8 +268,6 @@ where
     W: Write,
     R: Read + BufRead,
 {
-    let _guard = crate::ops::enter_heavy_op();
-
     let schema = crate::schema::get_schema(&sort.underlying, ctx)?;
     let sort_keys: Vec<(usize, bool)> = sort
         .sort_specs
@@ -290,7 +288,10 @@ where
     // Stream the data
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
+    let chunk_limit_bytes = crate::ops::operator_budget_bytes(memory_limit_mb);
     let mut current_chunk_bytes = 0;
+    
+    let (_, mut chunk_out) = crate::io_setup::setup_disk_io();
 
     execute_op(
         &sort.underlying,
@@ -304,11 +305,8 @@ where
             current_chunk_bytes += row_len;
             current_chunk.push(row.to_vec());
 
-            // Recompute budget dynamically: as inner operators start (live count
-            // increases), the threshold shrinks, causing earlier flush. This
-            // prevents sort from hogging 28MB while joins also need memory.
-            let chunk_limit = crate::ops::operator_budget_bytes(memory_limit_mb);
-            if current_chunk_bytes >= chunk_limit {
+            // If chunk reaches byte limit, sort it in memory and flush to scratch disk
+            if current_chunk_bytes >= chunk_limit_bytes {
                 current_chunk.sort_by(|a, b| {
                     for (idx, ascending) in &sort_keys {
                         let ord = a[*idx]
@@ -325,10 +323,14 @@ where
                 let packed = pack_blocks(&current_chunk, block_size).unwrap();
                 let num_blocks = packed.len() / block_size;
                 let run_start = crate::disk::allocate_anon_block_chunk(num_blocks as u64);
-                let mut chunk_out = crate::io_setup::setup_disk_io().1;
+                
                 write_blocks(&mut chunk_out, run_start, num_blocks, &packed).unwrap();
 
-                runs.push(Run { start_block: run_start, num_blocks });
+                runs.push(Run {
+                    start_block: run_start,
+                    num_blocks,
+                });
+
                 current_chunk.clear();
                 current_chunk_bytes = 0;
             }
@@ -389,7 +391,7 @@ where
 
     eprintln!("[sort] merging {} spilled runs", runs.len());
 
-    const MAX_MERGE_WIDTH: usize = 32;
+    const MAX_MERGE_WIDTH: usize = 12;
 
     // Cascading merge: if too many runs for a single merge pass, merge in
     // groups of MAX_MERGE_WIDTH, producing fewer intermediate runs, and repeat
@@ -451,7 +453,8 @@ where
         }
     }
 
-    // Rewind anonymous block allocator for next operator - REMOVED TO PREVENT CORRUPTION
+    // Rewind anonymous block allocator for next operator
+    crate::disk::rewind_anon_block_allocator();
 
     Ok(schema)
 }

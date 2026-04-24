@@ -12,27 +12,20 @@ use crate::row::{encode_row, decode_row};
 
 const NUM_BUCKETS: usize = 8;
 
-use std::rc::Rc;
-use std::cell::RefCell;
+// ── Bloom Filter (512 KB) ─────────────────────────────────────────────────────
+const BLOOM_BITS: usize = 4_194_304;           // 4M bits = 512 KB
+const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 65 536 u64s
 
-thread_local! {
-    pub static GLOBAL_BLOOM: RefCell<Vec<(String, Rc<BloomFilter>)>> = RefCell::new(Vec::new());
-}
-
-// ── Bloom Filter (64 KB) ──────────────────────────────────────────────────────
-const BLOOM_BITS: usize = 524_288;             // 512K bits = 64 KB
-const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 8 192 u64s
-
-pub struct BloomFilter {
-    pub bits: Vec<u64>,
+struct BloomFilter {
+    bits: Vec<u64>,
 }
 
 impl BloomFilter {
-    pub fn new() -> Self {
+    fn new() -> Self {
         BloomFilter { bits: vec![0u64; BLOOM_WORDS] }
     }
 
-    pub fn bit_positions(key: &Data) -> [usize; 3] {
+    fn bit_positions(key: &Data) -> [usize; 3] {
         let mut h = DefaultHasher::new();
         hash_data(key, &mut h);
         let h1 = h.finish();
@@ -45,14 +38,14 @@ impl BloomFilter {
         ]
     }
 
-    pub fn insert(&mut self, key: &Data) {
+    fn insert(&mut self, key: &Data) {
         for pos in Self::bit_positions(key) {
             self.bits[pos >> 6] |= 1u64 << (pos & 63);
         }
     }
 
     #[inline]
-    pub fn might_contain(&self, key: &Data) -> bool {
+    fn might_contain(&self, key: &Data) -> bool {
         for pos in Self::bit_positions(key) {
             if self.bits[pos >> 6] & (1u64 << (pos & 63)) == 0 {
                 return false;
@@ -94,6 +87,51 @@ fn pack_rows_into_blocks(rows: &[Vec<Data>], block_size: usize) -> Vec<u8> {
     }
 
     all_bytes
+}
+
+struct GraceBuffer {
+    bytes: Vec<u8>,
+    current_block: Vec<u8>,
+    row_count: u16,
+    pub total_bytes: usize,
+}
+
+impl GraceBuffer {
+    fn new(block_size: usize) -> Self {
+        GraceBuffer {
+            bytes: Vec::new(),
+            current_block: Vec::with_capacity(block_size),
+            row_count: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn push_row(&mut self, row: &[Data], block_size: usize) {
+        let mut row_bytes = Vec::new();
+        encode_row(row, &mut row_bytes);
+        self.total_bytes += row_bytes.len();
+
+        if self.current_block.len() + row_bytes.len() > block_size - 2 {
+            self.current_block.resize(block_size - 2, 0);
+            self.current_block.extend_from_slice(&self.row_count.to_le_bytes());
+            self.bytes.extend_from_slice(&self.current_block);
+            self.current_block.clear();
+            self.row_count = 0;
+        }
+
+        self.current_block.extend_from_slice(&row_bytes);
+        self.row_count += 1;
+    }
+
+    fn finish_block(&mut self, block_size: usize) {
+        if !self.current_block.is_empty() {
+            self.current_block.resize(block_size - 2, 0);
+            self.current_block.extend_from_slice(&self.row_count.to_le_bytes());
+            self.bytes.extend_from_slice(&self.current_block);
+            self.current_block.clear();
+            self.row_count = 0;
+        }
+    }
 }
 
 fn unpack_block(
@@ -160,15 +198,15 @@ struct BucketRun {
 /// FD wrapper (setup_disk_io().1), as that would interleave bytes on the
 /// underlying FD and corrupt the disk protocol stream.
 fn flush_bucket<W: Write>(
-    buffer: &mut Vec<Vec<Data>>,
+    buffer: &mut GraceBuffer,
     runs: &mut Vec<BucketRun>,
     disk_out: &mut W,
     block_size: usize
 ) -> Result<()> {
-    if buffer.is_empty() { return Ok(()); }
+    buffer.finish_block(block_size);
+    if buffer.bytes.is_empty() { return Ok(()); }
 
-    let packed = pack_rows_into_blocks(buffer, block_size);
-    let num_blocks = packed.len() / block_size;
+    let num_blocks = buffer.bytes.len() / block_size;
     let start = crate::disk::allocate_anon_block_chunk(num_blocks as u64);
 
     let max_write_blocks = 256;
@@ -182,13 +220,14 @@ fn flush_bucket<W: Write>(
             disk_out,
             start + written_blocks as u64,
             to_write,
-            &packed[byte_start..byte_end]
+            &buffer.bytes[byte_start..byte_end]
         )?;
         written_blocks += to_write;
     }
 
     runs.push(BucketRun { start_block: start, num_blocks });
-    buffer.clear();
+    buffer.bytes.clear();
+    buffer.total_bytes = 0;
     Ok(())
 }
 
@@ -205,8 +244,6 @@ where
     W: Write,
     R: Read + BufRead,
 {
-    let _guard = crate::ops::enter_heavy_op();
-
     let left_schema = get_schema(&join.left, ctx)?;
     let right_schema = get_schema(&join.right, ctx)?;
 
@@ -221,8 +258,9 @@ where
 
     crate::disk::init_anon_block_allocator(disk_out, disk_buf)?;
 
-    // Budget is recomputed dynamically inside closures so it adapts
-    // as inner operators start/stop (live count changes).
+    // Dynamic budget
+    let mem_budget = crate::ops::operator_budget_bytes(memory_limit_mb);
+    let bucket_byte_limit = std::cmp::max(1, mem_budget / NUM_BUCKETS);
 
     // Bloom filter: built during right-side collection
     let mut bloom = BloomFilter::new();
@@ -231,23 +269,30 @@ where
     let mut right_total_bytes: usize = 0;
     let mut budget_exceeded = false;
 
-    // Grace buffers: keyed by bucket. NEVER flushed inside the closure.
-    // Flushing inside would create a 2nd WriteFdWrapper on FD 4 and interleave
-    // bytes with execute_op's own disk traffic, corrupting the protocol.
+    // Grace-mode per-bucket in-memory accumulators.
+    // These are only filled AFTER execute_op returns (we do NOT flush inside
+    // the closure) to avoid a second concurrent FdWrapper writing to FD 4.
     let mut right_runs: Vec<Vec<BucketRun>> = vec![Vec::new(); NUM_BUCKETS];
-    let mut grace_buffers: Vec<Vec<Vec<Data>>> = vec![Vec::new(); NUM_BUCKETS];
-    let mut grace_bucket_bytes: Vec<usize> = vec![0; NUM_BUCKETS];
+    let mut grace_buffers: Vec<GraceBuffer> = (0..NUM_BUCKETS).map(|_| GraceBuffer::new(block_size)).collect();
 
+    let (_, mut chunk_out) = crate::io_setup::setup_disk_io();
+
+    // ── Collect right side ────────────────────────────────────────────────
+    // NOTE: We intentionally do NOT write to disk inside this closure.
+    // Any disk write here would use a second WriteFdWrapper on FD 4,
+    // interleaving with execute_op's own disk_out traffic → corruption.
+    // Instead we accumulate everything in grace_buffers and flush afterward.
     execute_op(
         &join.right, ctx, disk_out, disk_buf, block_size,
         memory_limit_mb,
         &mut |row| {
             let row_len = crate::row::encode_row_len(row);
             right_total_bytes += row_len;
+
+            // Always insert into bloom filter
             bloom.insert(&row[right_join_idx]);
 
-            let cur_budget = crate::ops::operator_budget_bytes(memory_limit_mb);
-            if !budget_exceeded && right_total_bytes <= cur_budget {
+            if !budget_exceeded && right_total_bytes <= mem_budget {
                 right_rows.push(row.to_vec());
                 return Ok(());
             }
@@ -256,19 +301,17 @@ where
                 budget_exceeded = true;
                 eprintln!(
                     "[hash_join] Grace switch at {} bytes (budget {})",
-                    right_total_bytes, cur_budget
+                    right_total_bytes, mem_budget
                 );
-                // Redistribute already-collected rows into buckets, flushing overflows
+
+                // Redistribute already-collected rows into grace buckets
                 for old_row in right_rows.drain(..) {
                     let mut hasher = DefaultHasher::new();
                     hash_data(&old_row[right_join_idx], &mut hasher);
                     let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
-                    grace_bucket_bytes[bucket] += crate::row::encode_row_len(&old_row);
-                    grace_buffers[bucket].push(old_row);
-                    if grace_bucket_bytes[bucket] >= std::cmp::max(1, cur_budget / NUM_BUCKETS) {
-                        let mut chunk_out = crate::io_setup::setup_disk_io().1;
+                    grace_buffers[bucket].push_row(&old_row, block_size);
+                    if grace_buffers[bucket].total_bytes >= bucket_byte_limit {
                         flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
-                        grace_bucket_bytes[bucket] = 0;
                     }
                 }
                 right_rows.shrink_to_fit();
@@ -277,19 +320,18 @@ where
             let mut hasher = DefaultHasher::new();
             hash_data(&row[right_join_idx], &mut hasher);
             let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
-            grace_bucket_bytes[bucket] += row_len;
-            grace_buffers[bucket].push(row.to_vec());
-            // Flush bucket if it overflows — chunk_out safe between block-read cycles
-            if grace_bucket_bytes[bucket] >= std::cmp::max(1, cur_budget / NUM_BUCKETS) {
-                let mut chunk_out = crate::io_setup::setup_disk_io().1;
+            grace_buffers[bucket].push_row(row, block_size);
+            
+            if grace_buffers[bucket].total_bytes >= bucket_byte_limit {
                 flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
-                grace_bucket_bytes[bucket] = 0;
             }
+
             Ok(())
         }
     )?;
 
-    // Flush right grace buffers — safe now that execute_op has returned
+    // ── Flush all grace buffers to disk now that execute_op has returned ──
+    // disk_out is exclusively ours again; no interleaving possible.
     if budget_exceeded {
         eprintln!(
             "[hash_join] Grace mode: right {} bytes, {} buckets",
@@ -300,13 +342,12 @@ where
         }
     }
     drop(grace_buffers);
-    drop(grace_bucket_bytes);
 
     // ── FAST PATH: In-memory hash join ────────────────────────────────────
     if !budget_exceeded {
         eprintln!(
             "[hash_join] In-memory: {} right rows ({} bytes, budget {})",
-            right_rows.len(), right_total_bytes, crate::ops::operator_budget_bytes(memory_limit_mb)
+            right_rows.len(), right_total_bytes, mem_budget
         );
 
         let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
@@ -315,17 +356,12 @@ where
             build_hash.entry(key).or_default().push(row);
         }
 
-        let bloom_rc = Rc::new(bloom);
-        GLOBAL_BLOOM.with(|g| {
-            g.borrow_mut().push((join.left_join_col.clone(), bloom_rc.clone()));
-        });
-
         execute_op(
             &join.left, ctx, disk_out, disk_buf, block_size,
             memory_limit_mb,
             &mut |left_row| {
                 // Bloom filter: skip if definitely no match
-                if !bloom_rc.might_contain(&left_row[left_join_idx]) {
+                if !bloom.might_contain(&left_row[left_join_idx]) {
                     return Ok(());
                 }
                 let key = HashKey(left_row[left_join_idx].clone());
@@ -340,59 +376,56 @@ where
             }
         )?;
 
-        GLOBAL_BLOOM.with(|g| { g.borrow_mut().pop(); });
         return Ok(combined_schema);
     }
-    
-    let bloom_rc = Rc::new(bloom);
-    GLOBAL_BLOOM.with(|g| {
-        g.borrow_mut().push((join.left_join_col.clone(), bloom_rc.clone()));
-    });
 
-    // ── GRACE PATH: partition left side ──────────────────────────────────
+    // ── GRACE PATH: partition left side & probe ──────────────────────────
     let mut left_runs: Vec<Vec<BucketRun>> = vec![Vec::new(); NUM_BUCKETS];
-    let mut grace_l_bufs: Vec<Vec<Vec<Data>>> = vec![Vec::new(); NUM_BUCKETS];
-    let mut grace_l_bytes: Vec<usize> = vec![0; NUM_BUCKETS];
 
-    execute_op(
-        &join.left, ctx, disk_out, disk_buf, block_size, memory_limit_mb,
-        &mut |row| {
-            if !bloom_rc.might_contain(&row[left_join_idx]) {
-                return Ok(());
+    {
+        // Accumulate left side into per-bucket in-memory buffers.
+        // Again: no disk writes inside the closure — flush afterward.
+        let mut left_buffers: Vec<GraceBuffer> = (0..NUM_BUCKETS).map(|_| GraceBuffer::new(block_size)).collect();
+
+        let (_, mut left_chunk_out) = crate::io_setup::setup_disk_io();
+
+        execute_op(
+            &join.left, ctx, disk_out, disk_buf, block_size,
+            memory_limit_mb,
+            &mut |row| {
+                // Bloom filter: skip rows that definitely have no match
+                if !bloom.might_contain(&row[left_join_idx]) {
+                    return Ok(());
+                }
+
+                let mut hasher = DefaultHasher::new();
+                hash_data(&row[left_join_idx], &mut hasher);
+                let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
+
+                left_buffers[bucket].push_row(row, block_size);
+                if left_buffers[bucket].total_bytes >= bucket_byte_limit {
+                    flush_bucket(&mut left_buffers[bucket], &mut left_runs[bucket], &mut left_chunk_out, block_size)?;
+                }
+                Ok(())
             }
-            let mut h = DefaultHasher::new();
-            hash_data(&row[left_join_idx], &mut h);
-            let b = (h.finish() as usize) % NUM_BUCKETS;
-            grace_l_bytes[b] += crate::row::encode_row_len(row);
-            grace_l_bufs[b].push(row.to_vec());
-            // Flush bucket if it overflows — chunk_out is safe (between block-read cycles)
-            if grace_l_bytes[b] >= std::cmp::max(1, crate::ops::operator_budget_bytes(memory_limit_mb) / NUM_BUCKETS) {
-                let mut chunk_out = crate::io_setup::setup_disk_io().1;
-                flush_bucket(&mut grace_l_bufs[b], &mut left_runs[b], &mut chunk_out, block_size)?;
-                grace_l_bytes[b] = 0;
-            }
-            Ok(())
+        )?;
+
+        // Flush all left buckets after execute_op returns.
+        for b in 0..NUM_BUCKETS {
+            flush_bucket(&mut left_buffers[b], &mut left_runs[b], disk_out, block_size)?;
         }
-    )?;
-
-    // Pop bloom filter before Phase 3 (no more scans needed)
-    drop(bloom_rc);
-    GLOBAL_BLOOM.with(|g| { g.borrow_mut().pop(); });
-
-    // Flush remaining left buckets using canonical disk_out
-    for b in 0..NUM_BUCKETS {
-        flush_bucket(&mut grace_l_bufs[b], &mut left_runs[b], disk_out, block_size)?;
     }
-    drop(grace_l_bufs);
-    drop(grace_l_bytes);
 
-    // Phase 3: all other operators dropped — recompute fresh budget
-    let phase3_budget = crate::ops::operator_budget_bytes(memory_limit_mb);
+    drop(bloom);
+
+    // Phase 3: Multi-pass probe — load right side in memory-safe chunks
+    // Budget dynamically set to prevent allocator fragmentation
+    // or HashMap virtual memory resizing from blowing the strict 64MB total limit.
+    let phase3_budget: usize = mem_budget;
 
     eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
 
     for b in 0..NUM_BUCKETS {
-
         if right_runs[b].is_empty() { continue; }
 
         // Flatten right-side runs into a sequential block list
@@ -484,6 +517,7 @@ where
                 }
             }
 
+            // If we've exhausted all right segments, done with this bucket
             if seg_idx >= right_segs.len() {
                 break;
             }

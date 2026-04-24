@@ -253,33 +253,6 @@ fn optimize_join_order(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
     }
 }
 
-fn produces_ordered_stream(op: &QueryOp, col_name: &str, ctx: &DbContext) -> bool {
-    match op {
-        QueryOp::Scan(s) => {
-            if let Some(spec) = ctx.get_table_specs().iter().find(|t| t.file_id == s.table_id) {
-                if let Some(col_spec) = spec.column_specs.iter().find(|c| c.column_name == col_name) {
-                    if let Some(stats) = &col_spec.stats {
-                        return stats.iter().any(|st| matches!(st, db_config::statistics::ColumnStat::IsPhysicallyOrdered));
-                    }
-                }
-            }
-            false
-        }
-        QueryOp::Filter(f) => produces_ordered_stream(&*f.underlying, col_name, ctx),
-        QueryOp::Project(p) => {
-            let mut underlying_col = col_name.to_string();
-            for (from, to) in &p.column_name_map {
-                if to == col_name {
-                    underlying_col = from.clone();
-                    break;
-                }
-            }
-            produces_ordered_stream(&*p.underlying, &underlying_col, ctx)
-        }
-        _ => false,
-    }
-}
-
 fn optimize_rewrites(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
     match op {
         QueryOp::Filter(mut f) => {
@@ -398,20 +371,15 @@ fn optimize_rewrites(op: QueryOp, ctx: &DbContext) -> Result<QueryOp> {
             Ok(QueryOp::Filter(f))
         }
         QueryOp::Sort(mut s) => {
-            let optimized_underlying = optimize_rewrites(*s.underlying, ctx)?;
+            s.underlying = Box::new(optimize_rewrites(*s.underlying, ctx)?);
 
             // Sort elision (Sort -> Sort) => Outer Sort wins
-            s.underlying = match optimized_underlying {
-                QueryOp::Sort(inner_sort) => inner_sort.underlying,
-                other => Box::new(other),
-            };
+            if let QueryOp::Sort(inner_sort) = *s.underlying {
+                s.underlying = inner_sort.underlying; // drop the inner sort completely
+            }
 
-            // IsPhysicallyOrdered Elision via stats
-            if let Some(first_sort) = s.sort_specs.first() {
-                if first_sort.ascending && produces_ordered_stream(&*s.underlying, &first_sort.column_name, ctx) {
-                    eprintln!("[optimizer] Eliding sort on {} (IsPhysicallyOrdered)", first_sort.column_name);
-                    return Ok(*s.underlying);
-                }
+            if sort_is_physically_ordered(&s.underlying, &s.sort_specs, ctx) {
+                return Ok(*s.underlying);
             }
 
             Ok(QueryOp::Sort(s))
@@ -738,5 +706,54 @@ pub fn max_concurrent_heavy_ops(op: &QueryOp) -> usize {
         QueryOp::Filter(f) => max_concurrent_heavy_ops(&f.underlying),
         QueryOp::Project(p) => max_concurrent_heavy_ops(&p.underlying),
         QueryOp::Scan(_) => 0,
+    }
+}
+
+fn sort_is_physically_ordered(op: &QueryOp, specs: &[common::query::SortSpec], ctx: &DbContext) -> bool {
+    if specs.len() != 1 {
+        return false;
+    }
+    let spec = &specs[0];
+    if !spec.ascending {
+        return false; // IsPhysicallyOrdered implies ascending
+    }
+
+    match op {
+        QueryOp::Scan(scan_data) => {
+            if let Some(table_spec) = ctx.get_table_specs().iter().find(|t| t.file_id == scan_data.table_id) {
+                if let Some(col_spec) = table_spec.column_specs.iter().find(|c| c.column_name == spec.column_name) {
+                    if let Some(stats) = &col_spec.stats {
+                        for stat in stats {
+                            if matches!(stat, db_config::statistics::ColumnStat::IsPhysicallyOrdered) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+        QueryOp::Filter(f) => sort_is_physically_ordered(&f.underlying, specs, ctx),
+        QueryOp::Project(p) => {
+            let mut mapped_specs = Vec::new();
+            for s in specs {
+                let mut found = false;
+                for (from, to) in &p.column_name_map {
+                    if to == &s.column_name {
+                        mapped_specs.push(common::query::SortSpec {
+                            column_name: from.clone(),
+                            ascending: s.ascending,
+                        });
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return false;
+                }
+            }
+            sort_is_physically_ordered(&p.underlying, &mapped_specs, ctx)
+        }
+        _ => false,
     }
 }

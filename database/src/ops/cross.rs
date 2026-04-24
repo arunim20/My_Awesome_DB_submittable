@@ -93,6 +93,8 @@ where
     let mut block_idx = 0usize;
     let right_buffer_blocks = std::cmp::min(256, std::cmp::max(1, (memory_limit_mb as usize * 1024 * 1024 * 10 / 100) / block_size));
 
+    let mut combined = Vec::with_capacity(combined_schema.len());
+
     while block_idx < total_right_blocks {
         let fetch = std::cmp::min(right_buffer_blocks, total_right_blocks - block_idx);
 
@@ -117,7 +119,8 @@ where
                         }
                     }
 
-                    let mut combined = left_row.clone();
+                    combined.clear();
+                    combined.extend_from_slice(left_row);
                     combined.extend_from_slice(right_row);
                     on_row(&combined)?;
                 }
@@ -212,17 +215,21 @@ where
     }
 
     if !right_row_buf.is_empty() {
-        let packed = pack_rows_into_blocks(&right_row_buf, block_size);
-        let num_blocks = packed.len() / block_size;
-        
-        let allocated_start = crate::disk::allocate_anon_block_chunk(num_blocks as u64);
-        if right_start_block == 0 {
-            right_start_block = allocated_start;
-        }
+        if total_right_blocks > 0 {
+            let packed = pack_rows_into_blocks(&right_row_buf, block_size);
+            let num_blocks = packed.len() / block_size;
+            
+            let allocated_start = crate::disk::allocate_anon_block_chunk(num_blocks as u64);
+            if right_start_block == 0 {
+                right_start_block = allocated_start;
+            }
 
-        write_blocks(disk_out, allocated_start, num_blocks, &packed)?;
-        total_right_blocks += num_blocks;
-        right_row_buf.clear();
+            write_blocks(disk_out, allocated_start, num_blocks, &packed)?;
+            total_right_blocks += num_blocks;
+            right_row_buf.clear();
+        } else {
+            eprintln!("[cross] fast path: right side fits entirely in memory ({} rows)", right_row_buf.len());
+        }
     }
 
     eprintln!("[cross] right materialised: {} blocks", total_right_blocks);
@@ -230,11 +237,39 @@ where
     let mut combined_schema = left_schema.clone();
     combined_schema.extend(right_schema.clone());
 
-    if total_right_blocks == 0 {
+    if total_right_blocks == 0 && right_row_buf.is_empty() {
         return Ok(combined_schema);
     }
 
     // ── Phase 2: Stream LEFT → join against right scratch ─────────────────────
+
+    if total_right_blocks == 0 {
+        // Fast path: In-memory right side
+        execute_op(
+            &cross.left,
+            ctx,
+            disk_out,
+            disk_buf,
+            block_size,
+            memory_limit_mb,
+            &mut |left_row| {
+                let mut combined = Vec::with_capacity(combined_schema.len());
+                for right_row in &right_row_buf {
+                    if let Some(preds) = predicates {
+                        if !crate::row::apply_split_predicates(left_row, right_row, &combined_schema, preds)? {
+                            continue;
+                        }
+                    }
+                    combined.clear();
+                    combined.extend_from_slice(left_row);
+                    combined.extend_from_slice(right_row);
+                    on_row(&combined)?;
+                }
+                Ok(())
+            },
+        )?;
+        return Ok(combined_schema);
+    }
 
     let (inner_in_raw, mut inner_out2) = setup_disk_io();
     let mut inner_buf = BufReader::new(inner_in_raw);
