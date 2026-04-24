@@ -21,11 +21,11 @@ pub fn set_heavy_op_count(count: usize) {
 pub fn operator_budget_bytes(memory_limit_mb: u64) -> usize {
     let count = HEAVY_OP_COUNT.load(Ordering::SeqCst).max(1);
     let total_bytes = memory_limit_mb as usize * 1024 * 1024;
-    let fixed_overhead = 19 * 1024 * 1024;
+    let fixed_overhead = 26 * 1024 * 1024; // Buffer for allocator spike and bloom filters
     let available = total_bytes.saturating_sub(fixed_overhead);
     let dynamic = available / (count + 1);
-    // 12% hard cap: safe for Grace switch with encode_row_len's built-in overhead
-    let max_budget = total_bytes * 12 / 100;
+    // 6% hard cap: ultra-safe for Grace switch
+    let max_budget = total_bytes * 6 / 100;
     std::cmp::min(dynamic, max_budget)
 }
 pub mod cross;
