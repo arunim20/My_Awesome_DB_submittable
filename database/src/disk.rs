@@ -15,14 +15,11 @@ pub fn ask_disk_line<R: BufRead>(
     Ok(line.trim().to_string())
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 static DISK_WRITE_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-/// #4: 4MB write buffer — 4× larger than the old 1MB limit.
-/// During sort run-creation (1000+ write_blocks calls) and grace-join flushing,
-/// this slashes kernel write() syscalls and IPC fragment count by 4×.
-const DISK_BUFFER_LIMIT: usize = 4 * 1024 * 1024; // 4MB
+static DISK_BUFFER_LIMIT: AtomicUsize = AtomicUsize::new(4 * 1024 * 1024); // Default 4MB
 
 pub fn flush_disk_write_buffer(disk_out: &mut impl Write) -> Result<()> {
     let mut buf = DISK_WRITE_BUFFER.lock().unwrap();
@@ -32,6 +29,20 @@ pub fn flush_disk_write_buffer(disk_out: &mut impl Write) -> Result<()> {
         buf.clear();
     }
     Ok(())
+}
+
+pub fn set_global_budgets(memory_limit_mb: u64) {
+    let total_bytes = memory_limit_mb as usize * 1024 * 1024;
+    // Cache: ~18% of memory (was 12MB for 64MB)
+    let cache_limit = total_bytes * 18 / 100;
+    CACHE_LIMIT_BYTES.store(cache_limit, Ordering::SeqCst);
+    A1_IN_LIMIT.store(cache_limit / 4, Ordering::SeqCst);
+    
+    // Write buffer: ~6% of memory (was 4MB for 64MB)
+    let write_limit = total_bytes * 6 / 100;
+    DISK_BUFFER_LIMIT.store(write_limit, Ordering::SeqCst);
+    
+    eprintln!("[disk] Dynamic budgets: cache={}MB, write_buf={}MB", cache_limit/1024/1024, write_limit/1024/1024);
 }
 
 static NEXT_ANON_BLOCK: AtomicU64 = AtomicU64::new(0);
@@ -150,8 +161,8 @@ impl TwoQueueCache {
 }
 
 static CACHE: Mutex<TwoQueueCache> = Mutex::new(TwoQueueCache::new());
-const CACHE_LIMIT_BYTES: usize = 12 * 1024 * 1024; // 12MB — must stay low to fit in 64MB RLIMIT_AS
-const A1_IN_LIMIT: usize = 3 * 1024 * 1024; // 3MB (25% of cache)
+static CACHE_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(12 * 1024 * 1024); // Default 12MB
+static A1_IN_LIMIT: AtomicUsize = AtomicUsize::new(3 * 1024 * 1024); // Default 3MB
 
 pub fn read_blocks<R: Read>(
     disk_out: &mut impl Write,
@@ -190,7 +201,7 @@ pub fn read_blocks<R: Read>(
             start_block_id,
             num_blocks,
             data: buf.clone(),
-        }, CACHE_LIMIT_BYTES, A1_IN_LIMIT);
+        }, CACHE_LIMIT_BYTES.load(Ordering::SeqCst), A1_IN_LIMIT.load(Ordering::SeqCst));
     }
 
     Ok(buf)
@@ -277,7 +288,7 @@ pub fn write_blocks(
         let mut buf = DISK_WRITE_BUFFER.lock().unwrap();
         buf.extend_from_slice(format!("put block {} {}\n", start_block_id, num_blocks).as_bytes());
         buf.extend_from_slice(data);
-        if buf.len() >= DISK_BUFFER_LIMIT {
+        if buf.len() >= DISK_BUFFER_LIMIT.load(Ordering::SeqCst) {
             disk_out.write_all(&buf)?;
             disk_out.flush()?;
             buf.clear();
@@ -299,7 +310,7 @@ pub fn write_blocks(
             start_block_id,
             num_blocks,
             data: data.to_vec(),
-        }, CACHE_LIMIT_BYTES, A1_IN_LIMIT);
+        }, CACHE_LIMIT_BYTES.load(Ordering::SeqCst), A1_IN_LIMIT.load(Ordering::SeqCst));
     }
 
     Ok(())

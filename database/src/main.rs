@@ -68,6 +68,7 @@ fn db_main() -> Result<()> {
     monitor_buf.read_line(&mut input_line)?;
     let memory_limit_mb: u64 = input_line.trim().parse()?;
     eprintln!("Memory limit: {} MB", memory_limit_mb);
+    crate::disk::set_global_budgets(memory_limit_mb);
 
     // Begin output
     monitor_out.write_all(b"validate\n")?;
