@@ -34,7 +34,7 @@ where
     // Intercept Scan to perform Filter condition evaluations BEFORE row materialization (NEW-04)
     if let common::query::QueryOp::Scan(scan) = &*filter.underlying {
         return crate::ops::scan::execute_scan(
-            scan, ctx, disk_out, disk_buf, block_size, memory_limit_mb, Some(predicates), on_row
+            scan, ctx, disk_out, disk_buf, block_size, memory_limit_mb, Some(predicates), None, on_row
         );
     }
 

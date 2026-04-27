@@ -21,11 +21,12 @@ pub fn set_heavy_op_count(count: usize) {
 pub fn operator_budget_bytes(memory_limit_mb: u64) -> usize {
     let count = HEAVY_OP_COUNT.load(Ordering::SeqCst).max(1);
     let total_bytes = memory_limit_mb as usize * 1024 * 1024;
-    let fixed_overhead = 26 * 1024 * 1024; // Buffer for allocator spike and bloom filters
+    // Reserve 53% for OS runtime, disk cache, allocator fragmentation, and stack.
+    // Scales with any memory_limit rather than a hardcoded 34MB absolute.
+    let fixed_overhead = total_bytes * 53 / 100;
     let available = total_bytes.saturating_sub(fixed_overhead);
     let dynamic = available / (count + 1);
-    // 6% hard cap: ultra-safe for Grace switch
-    let max_budget = total_bytes * 6 / 100;
+    let max_budget = total_bytes * 15 / 100; // 15% hard cap
     std::cmp::min(dynamic, max_budget)
 }
 pub mod cross;
@@ -49,7 +50,7 @@ where
     R: Read + BufRead,
 {
     match op {
-        QueryOp::Scan(d)    => scan::execute_scan(d, ctx, disk_out, disk_buf, block_size, memory_limit_mb, None, on_row),
+        QueryOp::Scan(d)    => scan::execute_scan(d, ctx, disk_out, disk_buf, block_size, memory_limit_mb, None, None, on_row),
         QueryOp::Filter(d)  => filter::execute_filter(d, ctx, disk_out, disk_buf, block_size, memory_limit_mb, on_row),
         QueryOp::Project(d) => project::execute_project(d, ctx, disk_out, disk_buf, block_size, memory_limit_mb, on_row),
         QueryOp::Cross(d)   => cross::execute_cross(d, ctx, disk_out, disk_buf, block_size, memory_limit_mb, on_row),

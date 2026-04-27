@@ -10,11 +10,11 @@ use crate::ops::execute_op;
 use crate::schema::{get_schema, ColumnInfo};
 use crate::row::{encode_row, decode_row};
 
-const NUM_BUCKETS: usize = 8;
+const NUM_BUCKETS: usize = 16;
 
 // ── Bloom Filter (512 KB) ─────────────────────────────────────────────────────
-const BLOOM_BITS: usize = 4_194_304;           // 4M bits = 512 KB
-const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 65 536 u64s
+const BLOOM_BITS: usize = 524_288;             // 512K bits = 64 KB
+const BLOOM_WORDS: usize = BLOOM_BITS / 64;    // 8192 u64s
 
 struct BloomFilter {
     bits: Vec<u64>,
@@ -94,6 +94,8 @@ struct GraceBuffer {
     current_block: Vec<u8>,
     row_count: u16,
     pub total_bytes: usize,
+    /// UNC-16: Reusable encode scratch — eliminates one Vec alloc per push_row call.
+    row_scratch: Vec<u8>,
 }
 
 impl GraceBuffer {
@@ -103,15 +105,17 @@ impl GraceBuffer {
             current_block: Vec::with_capacity(block_size),
             row_count: 0,
             total_bytes: 0,
+            row_scratch: Vec::new(),
         }
     }
 
     fn push_row(&mut self, row: &[Data], block_size: usize) {
-        let mut row_bytes = Vec::new();
-        encode_row(row, &mut row_bytes);
-        self.total_bytes += row_bytes.len();
+        // UNC-16: reuse scratch buffer instead of allocating a new Vec each call
+        self.row_scratch.clear();
+        encode_row(row, &mut self.row_scratch);
+        self.total_bytes += self.row_scratch.len();
 
-        if self.current_block.len() + row_bytes.len() > block_size - 2 {
+        if self.current_block.len() + self.row_scratch.len() > block_size - 2 {
             self.current_block.resize(block_size - 2, 0);
             self.current_block.extend_from_slice(&self.row_count.to_le_bytes());
             self.bytes.extend_from_slice(&self.current_block);
@@ -119,7 +123,7 @@ impl GraceBuffer {
             self.row_count = 0;
         }
 
-        self.current_block.extend_from_slice(&row_bytes);
+        self.current_block.extend_from_slice(&self.row_scratch);
         self.row_count += 1;
     }
 
@@ -263,11 +267,12 @@ where
     let bucket_byte_limit = std::cmp::max(1, mem_budget / NUM_BUCKETS);
 
     // Bloom filter: built during right-side collection
-    let mut bloom = BloomFilter::new();
+    let mut blooms: Vec<BloomFilter> = (0..NUM_BUCKETS).map(|_| BloomFilter::new()).collect();
 
-    let mut right_rows: Vec<Vec<Data>> = Vec::new();
+    let mut spilled_buckets = vec![false; NUM_BUCKETS];
+    let mut in_memory_buckets: Vec<Vec<Vec<Data>>> = vec![Vec::new(); NUM_BUCKETS];
+    let mut bucket_bytes = vec![0usize; NUM_BUCKETS];
     let mut right_total_bytes: usize = 0;
-    let mut budget_exceeded = false;
 
     // Grace-mode per-bucket in-memory accumulators.
     // These are only filled AFTER execute_op returns (we do NOT flush inside
@@ -278,52 +283,56 @@ where
     let (_, mut chunk_out) = crate::io_setup::setup_disk_io();
 
     // ── Collect right side ────────────────────────────────────────────────
-    // NOTE: We intentionally do NOT write to disk inside this closure.
-    // Any disk write here would use a second WriteFdWrapper on FD 4,
-    // interleaving with execute_op's own disk_out traffic → corruption.
-    // Instead we accumulate everything in grace_buffers and flush afterward.
     execute_op(
         &join.right, ctx, disk_out, disk_buf, block_size,
         memory_limit_mb,
         &mut |row| {
             let row_len = crate::row::encode_row_len(row);
-            right_total_bytes += row_len;
-
-            // Always insert into bloom filter
-            bloom.insert(&row[right_join_idx]);
-
-            if !budget_exceeded && right_total_bytes <= mem_budget {
-                right_rows.push(row.to_vec());
-                return Ok(());
-            }
-
-            if !budget_exceeded {
-                budget_exceeded = true;
-                eprintln!(
-                    "[hash_join] Grace switch at {} bytes (budget {})",
-                    right_total_bytes, mem_budget
-                );
-
-                // Redistribute already-collected rows into grace buckets
-                for old_row in right_rows.drain(..) {
-                    let mut hasher = DefaultHasher::new();
-                    hash_data(&old_row[right_join_idx], &mut hasher);
-                    let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
-                    grace_buffers[bucket].push_row(&old_row, block_size);
-                    if grace_buffers[bucket].total_bytes >= bucket_byte_limit {
-                        flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
-                    }
-                }
-                right_rows.shrink_to_fit();
-            }
 
             let mut hasher = DefaultHasher::new();
             hash_data(&row[right_join_idx], &mut hasher);
             let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
-            grace_buffers[bucket].push_row(row, block_size);
-            
-            if grace_buffers[bucket].total_bytes >= bucket_byte_limit {
-                flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
+
+            // Always insert into bloom filter
+            blooms[bucket].insert(&row[right_join_idx]);
+
+            if spilled_buckets[bucket] {
+                grace_buffers[bucket].push_row(row, block_size);
+                if grace_buffers[bucket].total_bytes >= bucket_byte_limit {
+                    flush_bucket(&mut grace_buffers[bucket], &mut right_runs[bucket], &mut chunk_out, block_size)?;
+                }
+            } else {
+                in_memory_buckets[bucket].push(row.to_vec());
+                bucket_bytes[bucket] += row_len;
+                right_total_bytes += row_len;
+
+                if right_total_bytes > mem_budget {
+                    // Need to spill a bucket! Find the largest in-memory bucket
+                    let mut largest_bucket = 0;
+                    let mut max_bytes = 0;
+                    for b in 0..NUM_BUCKETS {
+                        if !spilled_buckets[b] && bucket_bytes[b] > max_bytes {
+                            max_bytes = bucket_bytes[b];
+                            largest_bucket = b;
+                        }
+                    }
+
+                    if max_bytes > 0 {
+                        spilled_buckets[largest_bucket] = true;
+                        right_total_bytes -= bucket_bytes[largest_bucket];
+                        bucket_bytes[largest_bucket] = 0;
+
+                        eprintln!("[hash_join] Hybrid spill: bucket {} ({} bytes spilled)", largest_bucket, max_bytes);
+
+                        for old_row in in_memory_buckets[largest_bucket].drain(..) {
+                            grace_buffers[largest_bucket].push_row(&old_row, block_size);
+                            if grace_buffers[largest_bucket].total_bytes >= bucket_byte_limit {
+                                flush_bucket(&mut grace_buffers[largest_bucket], &mut right_runs[largest_bucket], &mut chunk_out, block_size)?;
+                            }
+                        }
+                        in_memory_buckets[largest_bucket].shrink_to_fit();
+                    }
+                }
             }
 
             Ok(())
@@ -331,92 +340,80 @@ where
     )?;
 
     // ── Flush all grace buffers to disk now that execute_op has returned ──
-    // disk_out is exclusively ours again; no interleaving possible.
-    if budget_exceeded {
-        eprintln!(
-            "[hash_join] Grace mode: right {} bytes, {} buckets",
-            right_total_bytes, NUM_BUCKETS
-        );
-        for b in 0..NUM_BUCKETS {
+    for b in 0..NUM_BUCKETS {
+        if spilled_buckets[b] {
             flush_bucket(&mut grace_buffers[b], &mut right_runs[b], disk_out, block_size)?;
         }
     }
     drop(grace_buffers);
 
-    // ── FAST PATH: In-memory hash join ────────────────────────────────────
-    if !budget_exceeded {
-        eprintln!(
-            "[hash_join] In-memory: {} right rows ({} bytes, budget {})",
-            right_rows.len(), right_total_bytes, mem_budget
-        );
-
-        let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
-        for row in right_rows {
-            let key = HashKey(row[right_join_idx].clone());
-            build_hash.entry(key).or_default().push(row);
-        }
-
-        execute_op(
-            &join.left, ctx, disk_out, disk_buf, block_size,
-            memory_limit_mb,
-            &mut |left_row| {
-                // Bloom filter: skip if definitely no match
-                if !bloom.might_contain(&left_row[left_join_idx]) {
-                    return Ok(());
-                }
-                let key = HashKey(left_row[left_join_idx].clone());
-                if let Some(matches) = build_hash.get(&key) {
-                    for right_row in matches {
-                        let mut combined = left_row.to_vec();
-                        combined.extend(right_row.clone());
-                        on_row(&combined)?;
-                    }
-                }
-                Ok(())
+    // Build HashMap for in-memory buckets
+    let mut in_memory_hashes: Vec<HashMap<HashKey, Vec<Vec<Data>>>> = vec![HashMap::new(); NUM_BUCKETS];
+    for b in 0..NUM_BUCKETS {
+        if !spilled_buckets[b] {
+            for row in in_memory_buckets[b].drain(..) {
+                let key = HashKey(row[right_join_idx].clone());
+                in_memory_hashes[b].entry(key).or_default().push(row);
             }
-        )?;
-
-        return Ok(combined_schema);
+            in_memory_buckets[b].shrink_to_fit();
+        }
     }
 
-    // ── GRACE PATH: partition left side & probe ──────────────────────────
+    // ── Phase 2: Stream left side and probe in-memory buckets OR spill ────
     let mut left_runs: Vec<Vec<BucketRun>> = vec![Vec::new(); NUM_BUCKETS];
 
     {
-        // Accumulate left side into per-bucket in-memory buffers.
-        // Again: no disk writes inside the closure — flush afterward.
         let mut left_buffers: Vec<GraceBuffer> = (0..NUM_BUCKETS).map(|_| GraceBuffer::new(block_size)).collect();
-
         let (_, mut left_chunk_out) = crate::io_setup::setup_disk_io();
 
         execute_op(
             &join.left, ctx, disk_out, disk_buf, block_size,
             memory_limit_mb,
             &mut |row| {
-                // Bloom filter: skip rows that definitely have no match
-                if !bloom.might_contain(&row[left_join_idx]) {
-                    return Ok(());
-                }
-
                 let mut hasher = DefaultHasher::new();
                 hash_data(&row[left_join_idx], &mut hasher);
                 let bucket = (hasher.finish() as usize) % NUM_BUCKETS;
 
-                left_buffers[bucket].push_row(row, block_size);
-                if left_buffers[bucket].total_bytes >= bucket_byte_limit {
-                    flush_bucket(&mut left_buffers[bucket], &mut left_runs[bucket], &mut left_chunk_out, block_size)?;
+                // Bloom filter: skip rows that definitely have no match
+                if !blooms[bucket].might_contain(&row[left_join_idx]) {
+                    return Ok(());
+                }
+
+                if spilled_buckets[bucket] {
+                    // UNC-05: if right side for this bucket is entirely empty,
+                    // no left row can ever produce a match — skip writing to disk.
+                    if right_runs[bucket].is_empty() {
+                        return Ok(());
+                    }
+                    left_buffers[bucket].push_row(row, block_size);
+                    if left_buffers[bucket].total_bytes >= bucket_byte_limit {
+                        flush_bucket(&mut left_buffers[bucket], &mut left_runs[bucket], &mut left_chunk_out, block_size)?;
+                    }
+                } else {
+                    // Probe immediately!
+                    let key = HashKey(row[left_join_idx].clone());
+                    if let Some(matches) = in_memory_hashes[bucket].get(&key) {
+                        for right_row in matches {
+                            let mut combined = row.to_vec();
+                            combined.extend(right_row.clone());
+                            on_row(&combined)?;
+                        }
+                    }
                 }
                 Ok(())
             }
         )?;
 
-        // Flush all left buckets after execute_op returns.
+        // Flush all left buckets
         for b in 0..NUM_BUCKETS {
-            flush_bucket(&mut left_buffers[b], &mut left_runs[b], disk_out, block_size)?;
+            if spilled_buckets[b] {
+                flush_bucket(&mut left_buffers[b], &mut left_runs[b], disk_out, block_size)?;
+            }
         }
     }
 
-    drop(bloom);
+    drop(blooms);
+    drop(in_memory_hashes);
 
     // Phase 3: Multi-pass probe — load right side in memory-safe chunks
     // Budget dynamically set to prevent allocator fragmentation
@@ -425,11 +422,30 @@ where
 
     eprintln!("[hash_join] Phase 3: probing {} buckets", NUM_BUCKETS);
 
-    for b in 0..NUM_BUCKETS {
-        if right_runs[b].is_empty() { continue; }
+    // UNC-15: declare build_hash ONCE outside the bucket loop.
+    // HashMap::clear() retains the internal allocation, avoiding repeated
+    // multi-MB backing-array allocations across buckets.
+    let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
 
-        // Flatten right-side runs into a sequential block list
-        let right_segs: Vec<(u64, usize)> = right_runs[b]
+    for b in 0..NUM_BUCKETS {
+        // #5: skip if either side has no spilled rows — no output possible
+        if !spilled_buckets[b] || right_runs[b].is_empty() { continue; }
+        if left_runs[b].is_empty() {
+            eprintln!("[hash_join] Phase 3 bucket {}: no left runs, skipping all right reads", b);
+            continue;
+        }
+
+        let left_blocks: usize = left_runs[b].iter().map(|r| r.num_blocks).sum();
+        let right_blocks: usize = right_runs[b].iter().map(|r| r.num_blocks).sum();
+        
+        let (build_runs, probe_runs, build_schema, probe_schema, build_join_idx, probe_join_idx, left_is_build) = if left_blocks < right_blocks {
+            (&left_runs[b], &right_runs[b], &left_schema, &right_schema, left_join_idx, right_join_idx, true)
+        } else {
+            (&right_runs[b], &left_runs[b], &right_schema, &left_schema, right_join_idx, left_join_idx, false)
+        };
+
+        // Flatten build-side runs into a sequential block list
+        let build_segs: Vec<(u64, usize)> = build_runs
             .iter()
             .map(|r| (r.start_block, r.num_blocks))
             .collect();
@@ -439,13 +455,14 @@ where
         let mut blk_off: usize = 0;
 
         loop {
-            let mut build_hash: HashMap<HashKey, Vec<Vec<Data>>> = HashMap::new();
+            // UNC-15: reuse existing HashMap allocation (clear retains capacity)
+            build_hash.clear();
             let mut loaded_bytes: usize = 0;
             let mut any_loaded = false;
 
-            // ── Load right-side rows until budget exhausted or data done ──
-            'load_right: while seg_idx < right_segs.len() {
-                let (seg_start, seg_blocks) = right_segs[seg_idx];
+            // ── Load build-side rows until budget exhausted or data done ──
+            'load_build: while seg_idx < build_segs.len() {
+                let (seg_start, seg_blocks) = build_segs[seg_idx];
                 while blk_off < seg_blocks {
                     let fetch = std::cmp::min(32, seg_blocks - blk_off);
                     let buffer = crate::disk::read_blocks(
@@ -460,18 +477,18 @@ where
                         let rows = unpack_block(
                             &buffer[start..start + block_size],
                             block_size,
-                            &right_schema,
+                            build_schema,
                         )?;
                         for row in rows {
                             loaded_bytes += crate::row::encode_row_len(&row);
-                            let key = HashKey(row[right_join_idx].clone());
+                            let key = HashKey(row[build_join_idx].clone());
                             build_hash.entry(key).or_default().push(row);
                             any_loaded = true;
                         }
                     }
                     blk_off += fetch;
                     if loaded_bytes >= phase3_budget {
-                        break 'load_right;
+                        break 'load_build;
                     }
                 }
                 // Finished this segment, move to next
@@ -483,8 +500,8 @@ where
                 break;
             }
 
-            // ── Probe entire left side against this partial right HashMap ──
-            for run in &left_runs[b] {
+            // ── Probe entire probe side against this partial build HashMap ──
+            for run in probe_runs {
                 let mut rb = 0;
                 while rb < run.num_blocks {
                     let fetch = std::cmp::min(256, run.num_blocks - rb);
@@ -500,14 +517,20 @@ where
                         let rows = unpack_block(
                             &buffer[start..start + block_size],
                             block_size,
-                            &left_schema,
+                            probe_schema,
                         )?;
-                        for left_row in rows {
-                            let key = HashKey(left_row[left_join_idx].clone());
-                            if let Some(right_matches) = build_hash.get(&key) {
-                                for right_row in right_matches {
-                                    let mut combined = left_row.clone();
-                                    combined.extend(right_row.clone());
+                        for probe_row in rows {
+                            let key = HashKey(probe_row[probe_join_idx].clone());
+                            if let Some(build_matches) = build_hash.get(&key) {
+                                for build_row in build_matches {
+                                    let mut combined;
+                                    if left_is_build {
+                                        combined = build_row.clone();
+                                        combined.extend(probe_row.clone());
+                                    } else {
+                                        combined = probe_row.clone();
+                                        combined.extend(build_row.clone());
+                                    }
                                     on_row(&combined)?;
                                 }
                             }
@@ -517,8 +540,8 @@ where
                 }
             }
 
-            // If we've exhausted all right segments, done with this bucket
-            if seg_idx >= right_segs.len() {
+            // If we've exhausted all build segments, done with this bucket
+            if seg_idx >= build_segs.len() {
                 break;
             }
         }

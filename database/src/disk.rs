@@ -7,6 +7,7 @@ pub fn ask_disk_line<R: BufRead>(
     disk_buf: &mut R,
     cmd: &str,
 ) -> Result<String> {
+    flush_disk_write_buffer(disk_out)?;
     disk_out.write_all(cmd.as_bytes())?;
     disk_out.flush()?;
     let mut line = String::new();
@@ -14,8 +15,24 @@ pub fn ask_disk_line<R: BufRead>(
     Ok(line.trim().to_string())
 }
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+static DISK_WRITE_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// #4: 4MB write buffer — 4× larger than the old 1MB limit.
+/// During sort run-creation (1000+ write_blocks calls) and grace-join flushing,
+/// this slashes kernel write() syscalls and IPC fragment count by 4×.
+const DISK_BUFFER_LIMIT: usize = 4 * 1024 * 1024; // 4MB
+
+pub fn flush_disk_write_buffer(disk_out: &mut impl Write) -> Result<()> {
+    let mut buf = DISK_WRITE_BUFFER.lock().unwrap();
+    if !buf.is_empty() {
+        disk_out.write_all(&buf)?;
+        disk_out.flush()?;
+        buf.clear();
+    }
+    Ok(())
+}
 
 static NEXT_ANON_BLOCK: AtomicU64 = AtomicU64::new(0);
 static BASE_ANON_BLOCK: AtomicU64 = AtomicU64::new(0);
@@ -30,9 +47,111 @@ struct CacheEntry {
     data: Vec<u8>,
 }
 
-static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
-static CACHE_SIZE_BYTES: AtomicUsize = AtomicUsize::new(0);
-const CACHE_LIMIT_BYTES: usize = 4 * 1024 * 1024; // 4MB — must stay low to fit in 64MB RLIMIT_AS
+struct TwoQueueCache {
+    am: Vec<CacheEntry>,
+    a1_in: Vec<CacheEntry>,
+    a1_out: Vec<(u64, usize)>,
+    size_bytes: usize,
+}
+
+impl TwoQueueCache {
+    const fn new() -> Self {
+        TwoQueueCache {
+            am: Vec::new(),
+            a1_in: Vec::new(),
+            a1_out: Vec::new(),
+            size_bytes: 0,
+        }
+    }
+
+    fn remove_overlap(&mut self, start: u64, num: usize) -> Option<(CacheEntry, bool)> {
+        if let Some(idx) = self.am.iter().position(|e| {
+            start >= e.start_block_id && (start + num as u64) <= (e.start_block_id + e.num_blocks as u64)
+        }) {
+            return Some((self.am.remove(idx), true));
+        }
+        if let Some(idx) = self.a1_in.iter().position(|e| {
+            start >= e.start_block_id && (start + num as u64) <= (e.start_block_id + e.num_blocks as u64)
+        }) {
+            return Some((self.a1_in.remove(idx), false));
+        }
+        None
+    }
+
+    fn retain_anon_blocks(&mut self, base: u64) {
+        self.am.retain(|e| {
+            if e.start_block_id >= base {
+                self.size_bytes -= e.data.len();
+                false
+            } else { true }
+        });
+        self.a1_in.retain(|e| {
+            if e.start_block_id >= base {
+                self.size_bytes -= e.data.len();
+                false
+            } else { true }
+        });
+        self.a1_out.retain(|&(s, _)| s < base);
+    }
+
+    fn insert(&mut self, entry: CacheEntry, target_limit: usize, a1_in_limit: usize) {
+        if entry.data.len() > target_limit { return; }
+
+        let mut is_ghost_hit = false;
+        let start = entry.start_block_id;
+        let num = entry.num_blocks;
+        
+        if let Some(idx) = self.a1_out.iter().position(|&(g_start, g_num)| {
+            let end = start + num as u64;
+            let g_end = g_start + g_num as u64;
+            start < g_end && end > g_start
+        }) {
+            self.a1_out.remove(idx);
+            is_ghost_hit = true;
+        }
+
+        self.size_bytes += entry.data.len();
+        
+        if is_ghost_hit {
+            self.am.insert(0, entry);
+        } else {
+            self.a1_in.insert(0, entry);
+        }
+
+        while self.size_bytes > target_limit && (!self.am.is_empty() || !self.a1_in.is_empty()) {
+            let a1_in_bytes: usize = self.a1_in.iter().map(|e| e.data.len()).sum();
+            if a1_in_bytes > a1_in_limit || self.am.is_empty() {
+                if let Some(evicted) = self.a1_in.pop() {
+                    self.size_bytes -= evicted.data.len();
+                    self.a1_out.insert(0, (evicted.start_block_id, evicted.num_blocks));
+                    if self.a1_out.len() > 1000 {
+                        self.a1_out.pop();
+                    }
+                }
+            } else {
+                // UNC-07: Evict the LARGEST entry from am instead of always
+                // the LRU tail. This keeps small dimension-table blocks
+                // (nation=1 block, region=1 block) hot while large sort-run
+                // fetches are displaced first.
+                if let Some(largest_idx) = self.am
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, e)| e.data.len())
+                    .map(|(i, _)| i)
+                {
+                    let evicted = self.am.remove(largest_idx);
+                    self.size_bytes -= evicted.data.len();
+                } else if let Some(evicted) = self.am.pop() {
+                    self.size_bytes -= evicted.data.len();
+                }
+            }
+        }
+    }
+}
+
+static CACHE: Mutex<TwoQueueCache> = Mutex::new(TwoQueueCache::new());
+const CACHE_LIMIT_BYTES: usize = 12 * 1024 * 1024; // 12MB — must stay low to fit in 64MB RLIMIT_AS
+const A1_IN_LIMIT: usize = 3 * 1024 * 1024; // 3MB (25% of cache)
 
 pub fn read_blocks<R: Read>(
     disk_out: &mut impl Write,
@@ -43,13 +162,22 @@ pub fn read_blocks<R: Read>(
 ) -> Result<Vec<u8>> {
     {
         let mut cache = CACHE.lock().unwrap();
-        if let Some(idx) = cache.iter().position(|e| e.start_block_id == start_block_id && e.num_blocks == num_blocks) {
-            let entry = cache.remove(idx);
-            let data = entry.data.clone();
-            cache.insert(0, entry);
+        if let Some((entry, in_am)) = cache.remove_overlap(start_block_id, num_blocks) {
+            let offset_blocks = (start_block_id - entry.start_block_id) as usize;
+            let byte_start = offset_blocks * block_size;
+            let byte_end = byte_start + num_blocks * block_size;
+            let data = entry.data[byte_start..byte_end].to_vec();
+            
+            if in_am {
+                cache.am.insert(0, entry);
+            } else {
+                cache.a1_in.insert(0, entry);
+            }
             return Ok(data);
         }
     }
+
+    flush_disk_write_buffer(disk_out)?;
 
     disk_out.write_all(format!("get block {} {}\n", start_block_id, num_blocks).as_bytes())?;
     disk_out.flush()?;
@@ -58,22 +186,48 @@ pub fn read_blocks<R: Read>(
 
     {
         let mut cache = CACHE.lock().unwrap();
-        
-        while CACHE_SIZE_BYTES.load(Ordering::Relaxed) + buf.len() > CACHE_LIMIT_BYTES && !cache.is_empty() {
-            let removed = cache.pop().unwrap();
-            CACHE_SIZE_BYTES.fetch_sub(removed.data.len(), Ordering::Relaxed);
-        }
-        
-        if buf.len() <= CACHE_LIMIT_BYTES {
-            cache.insert(0, CacheEntry {
-                start_block_id,
-                num_blocks,
-                data: buf.clone(),
-            });
-            CACHE_SIZE_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+        cache.insert(CacheEntry {
+            start_block_id,
+            num_blocks,
+            data: buf.clone(),
+        }, CACHE_LIMIT_BYTES, A1_IN_LIMIT);
+    }
+
+    Ok(buf)
+}
+
+pub fn read_blocks_nocache<R: Read>(
+    disk_out: &mut impl Write,
+    disk_raw: &mut R,
+    start_block_id: u64,
+    num_blocks: usize,
+    block_size: usize,
+) -> Result<Vec<u8>> {
+    {
+        let mut cache = CACHE.lock().unwrap();
+        if let Some((entry, in_am)) = cache.remove_overlap(start_block_id, num_blocks) {
+            let offset_blocks = (start_block_id - entry.start_block_id) as usize;
+            let byte_start = offset_blocks * block_size;
+            let byte_end = byte_start + num_blocks * block_size;
+            let data = entry.data[byte_start..byte_end].to_vec();
+            
+            if in_am {
+                cache.am.insert(0, entry);
+            } else {
+                cache.a1_in.insert(0, entry);
+            }
+            return Ok(data);
         }
     }
 
+    flush_disk_write_buffer(disk_out)?;
+
+    disk_out.write_all(format!("get block {} {}\n", start_block_id, num_blocks).as_bytes())?;
+    disk_out.flush()?;
+    let mut buf = vec![0u8; num_blocks * block_size];
+    disk_raw.read_exact(&mut buf)?;
+
+    // We purposely do NOT insert into CACHE to avoid polluting it with massive sequential scans.
     Ok(buf)
 }
 
@@ -109,15 +263,7 @@ pub fn rewind_anon_block_allocator() {
         // Bulletproof Cache Correctness: Remove cached anonymous blocks so that they don't accidentally
         // serve stale mismatched-chunk data to the next operator reusing this space.
         let mut cache = CACHE.lock().unwrap();
-        
-        cache.retain(|e| {
-            if e.start_block_id >= base {
-                CACHE_SIZE_BYTES.fetch_sub(e.data.len(), Ordering::Relaxed);
-                false // remove
-            } else {
-                true // keep base table chunks safely!
-            }
-        });
+        cache.retain_anon_blocks(base);
     }
 }
 
@@ -127,31 +273,33 @@ pub fn write_blocks(
     num_blocks: usize,
     data: &[u8],
 ) -> Result<()> {
-    disk_out.write_all(format!("put block {} {}\n", start_block_id, num_blocks).as_bytes())?;
-    disk_out.write_all(data)?;
-    disk_out.flush()?;
+    {
+        let mut buf = DISK_WRITE_BUFFER.lock().unwrap();
+        buf.extend_from_slice(format!("put block {} {}\n", start_block_id, num_blocks).as_bytes());
+        buf.extend_from_slice(data);
+        if buf.len() >= DISK_BUFFER_LIMIT {
+            disk_out.write_all(&buf)?;
+            disk_out.flush()?;
+            buf.clear();
+        }
+    }
 
     {
         let mut cache = CACHE.lock().unwrap();
         
-        if let Some(idx) = cache.iter().position(|e| e.start_block_id == start_block_id && e.num_blocks == num_blocks) {
-            let removed = cache.remove(idx);
-            CACHE_SIZE_BYTES.fetch_sub(removed.data.len(), Ordering::Relaxed);
+        if let Some(idx) = cache.am.iter().position(|e| e.start_block_id == start_block_id && e.num_blocks == num_blocks) {
+            let removed = cache.am.remove(idx);
+            cache.size_bytes -= removed.data.len();
+        } else if let Some(idx) = cache.a1_in.iter().position(|e| e.start_block_id == start_block_id && e.num_blocks == num_blocks) {
+            let removed = cache.a1_in.remove(idx);
+            cache.size_bytes -= removed.data.len();
         }
 
-        while CACHE_SIZE_BYTES.load(Ordering::Relaxed) + data.len() > CACHE_LIMIT_BYTES && !cache.is_empty() {
-            let removed = cache.pop().unwrap();
-            CACHE_SIZE_BYTES.fetch_sub(removed.data.len(), Ordering::Relaxed);
-        }
-        
-        if data.len() <= CACHE_LIMIT_BYTES {
-            cache.insert(0, CacheEntry {
-                start_block_id,
-                num_blocks,
-                data: data.to_vec(),
-            });
-            CACHE_SIZE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
-        }
+        cache.insert(CacheEntry {
+            start_block_id,
+            num_blocks,
+            data: data.to_vec(),
+        }, CACHE_LIMIT_BYTES, A1_IN_LIMIT);
     }
 
     Ok(())

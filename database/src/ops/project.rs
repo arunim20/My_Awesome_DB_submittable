@@ -35,6 +35,55 @@ where
         })
         .collect::<Result<_>>()?;
 
+    let out_schema: Vec<ColumnInfo> = projections
+        .iter()
+        .map(|(_, name, dt)| ColumnInfo { name: name.clone(), data_type: dt.clone() })
+        .collect();
+
+    // Intercept Scan to perform Physical Projection
+    if let common::query::QueryOp::Scan(scan) = &*project.underlying {
+        let mut required = vec![false; child_schema.len()];
+        for (idx, _, _) in &projections {
+            required[*idx] = true;
+        }
+        crate::ops::scan::execute_scan(
+            scan, ctx, disk_out, disk_buf, block_size, memory_limit_mb, None, Some(&required), &mut |row| {
+                let projected: Vec<Data> =
+                    projections.iter().map(|(idx, _, _)| row[*idx].clone()).collect();
+                on_row(&projected)
+            }
+        )?;
+        return Ok(out_schema);
+    }
+
+    // Intercept Filter(Scan) to perform Physical Projection + Filter Pushdown
+    if let common::query::QueryOp::Filter(filter) = &*project.underlying {
+        if let common::query::QueryOp::Scan(scan) = &*filter.underlying {
+            let mut required = vec![false; child_schema.len()];
+            for (idx, _, _) in &projections {
+                required[*idx] = true;
+            }
+            for p in &filter.predicates {
+                if let Some(pos) = child_schema.iter().position(|c| c.name == p.column_name) {
+                    required[pos] = true;
+                }
+                if let common::query::ComparisionValue::Column(c) = &p.value {
+                    if let Some(pos) = child_schema.iter().position(|col| col.name == *c) {
+                        required[pos] = true;
+                    }
+                }
+            }
+            crate::ops::scan::execute_scan(
+                scan, ctx, disk_out, disk_buf, block_size, memory_limit_mb, Some(&filter.predicates), Some(&required), &mut |row| {
+                    let projected: Vec<Data> =
+                        projections.iter().map(|(idx, _, _)| row[*idx].clone()).collect();
+                    on_row(&projected)
+                }
+            )?;
+            return Ok(out_schema);
+        }
+    }
+
     execute_op(
         &project.underlying,
         ctx,
@@ -48,11 +97,6 @@ where
             on_row(&projected)
         },
     )?;
-
-    let out_schema = projections
-        .into_iter()
-        .map(|(_, name, dt)| ColumnInfo { name, data_type: dt })
-        .collect();
 
     Ok(out_schema)
 }

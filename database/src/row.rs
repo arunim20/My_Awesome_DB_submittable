@@ -42,6 +42,69 @@ pub fn decode_row(data: &[u8], mut offset: usize, schema: &[ColumnInfo]) -> Resu
     Ok((row, offset))
 }
 
+pub fn decode_row_partial(data: &[u8], mut offset: usize, schema: &[ColumnInfo], required_cols: Option<&[bool]>) -> Result<(Vec<Data>, usize)> {
+    if required_cols.is_none() {
+        return decode_row(data, offset, schema);
+    }
+    let reqs = required_cols.unwrap();
+    let mut row = Vec::with_capacity(schema.len());
+    for (i, col) in schema.iter().enumerate() {
+        let is_required = reqs[i];
+        match col.data_type {
+            DataType::Int32 => {
+                if is_required {
+                    let bytes: [u8; 4] = data[offset..offset + 4].try_into()?;
+                    row.push(Data::Int32(i32::from_le_bytes(bytes)));
+                } else {
+                    row.push(Data::Int32(0));
+                }
+                offset += 4;
+            }
+            DataType::Int64 => {
+                if is_required {
+                    let bytes: [u8; 8] = data[offset..offset + 8].try_into()?;
+                    row.push(Data::Int64(i64::from_le_bytes(bytes)));
+                } else {
+                    row.push(Data::Int64(0));
+                }
+                offset += 8;
+            }
+            DataType::Float32 => {
+                if is_required {
+                    let bytes: [u8; 4] = data[offset..offset + 4].try_into()?;
+                    row.push(Data::Float32(f32::from_le_bytes(bytes)));
+                } else {
+                    row.push(Data::Float32(0.0));
+                }
+                offset += 4;
+            }
+            DataType::Float64 => {
+                if is_required {
+                    let bytes: [u8; 8] = data[offset..offset + 8].try_into()?;
+                    row.push(Data::Float64(f64::from_le_bytes(bytes)));
+                } else {
+                    row.push(Data::Float64(0.0));
+                }
+                offset += 8;
+            }
+            DataType::String => {
+                let end = data[offset..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .context("Null terminator not found in string column")?;
+                if is_required {
+                    let s = std::str::from_utf8(&data[offset..offset + end])?.to_string();
+                    row.push(Data::String(s));
+                } else {
+                    row.push(Data::String(String::new()));
+                }
+                offset += end + 1;
+            }
+        }
+    }
+    Ok((row, offset))
+}
+
 pub fn encode_row(row: &[Data], out: &mut Vec<u8>) {
     for val in row {
         match val {
